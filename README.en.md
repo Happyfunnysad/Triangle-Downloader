@@ -13,7 +13,8 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
 - **Video** — 720p / 1080p as `.mp4` (video + audio).
 - **Audio** — `.mp3` (audio track only).
 - **Clip selection** — "start — end" fields in the menu (default `0:00:00` … full length).
-  Only the selected range is downloaded.
+  **Only the selected range is fetched**, not the whole video: e.g. 10 seconds out of an
+  hour-long video download in a couple of seconds.
 - **Subtitles** — `.txt` without timecodes. Prefers Russian, otherwise any available language.
 - **Video format** — "Fast" (VP9 in mp4, no re‑encoding, seconds) or "H.264" (re‑encode for
   compatibility with older players, slow).

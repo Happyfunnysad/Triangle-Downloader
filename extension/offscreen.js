@@ -67,56 +67,75 @@ async function finalize() {
     await inst.writeFile(vName, vBytes);
   }
 
-  // fragment trim: -ss before each input (keyframe seek), -t as output duration
-  const start = Math.max(0, Number(acc.start) || 0);
-  const end = Number(acc.end) || 0;
-  const dur = end > start ? end - start : 0;
-  const seek = start > 0 ? ['-ss', String(start)] : [];
-  const limit = dur > 0 ? ['-t', String(dur)] : [];
-  const inV = vName ? [...seek, '-i', vName] : [];
-  const inA = [...seek, '-i', aName];
+  // Fragment trim. IMPORTANT: -ss counts from the captured file's own beginning, and
+  // capture starts at a segment boundary at or before the requested start — so the
+  // offset here is RELATIVE (trimStart), never the absolute position in the video.
+  // Passing an absolute position produced an empty file (0 bytes of output).
+  const trimStart = Math.max(0, Number(acc.trimStart) || 0);
+  const trimDuration = Math.max(0, Number(acc.trimDuration) || 0);
+  const seek = trimStart > 0.05 ? ['-ss', trimStart.toFixed(3)] : [];
+  const limit = trimDuration > 0.05 ? ['-t', trimDuration.toFixed(3)] : [];
+  const inV = (s) => (vName ? [...s, '-i', vName] : []);
+  const inA = (s) => [...s, '-i', aName];
+  const ZERO = ['-avoid_negative_ts', 'make_zero'];
 
   const runs = [];
   if (isMp3) {
     runs.push({
-      out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
-      args: [...inA, ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
+      name: 'mp3', out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
+      args: [...inA(seek), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
     });
   } else if (acc.transcode) {
     // Slow path: re-encode to H.264 + AAC so the file plays everywhere.
     runs.push({
-      out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-      args: [...inV, ...inA, '-map', '0:v:0', '-map', '1:a:0', ...limit,
+      name: 'h264', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
+      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
         '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', 'out.mp4'],
     });
   } else {
     // Fast path: stream-copy the original tracks (VP9/Opus) into mp4 (seconds).
     runs.push({
-      out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-      args: [...inV, ...inA, '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c', 'copy', '-strict', '-2', '-movflags', '+faststart', 'out.mp4'],
+      name: 'mp4-copy', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
+      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
+        '-c', 'copy', '-strict', '-2', ...ZERO, '-movflags', '+faststart', 'out.mp4'],
     });
+    if (seek.length || limit.length) {
+      // If trimming upsets the copy path, keep the whole captured range rather than fail
+      // (it covers the fragment, just aligned to segment boundaries).
+      runs.push({
+        name: 'mp4-copy-untrimmed', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
+        args: [...inV([]), ...inA([]), '-map', '0:v:0', '-map', '1:a:0',
+          '-c', 'copy', '-strict', '-2', ...ZERO, '-movflags', '+faststart', 'out.mp4'],
+      });
+    }
     // If mp4 refuses these codecs, fall back to native WebM copy.
     runs.push({
-      out: 'out.webm', type: 'video/webm', ext: '.webm',
-      args: [...inV, ...inA, '-map', '0:v:0', '-map', '1:a:0', ...limit, '-c', 'copy', 'out.webm'],
+      name: 'webm-copy', out: 'out.webm', type: 'video/webm', ext: '.webm',
+      args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
+        '-c', 'copy', ...ZERO, 'out.webm'],
     });
   }
 
-  let data = null, chosen = null, lastErr = '';
+  let data = null, chosen = null;
+  const failures = [];
   for (const run of runs) {
     ffLog.length = 0;
-    const ret = await inst.exec(run.args);
+    let ret = -1;
+    try { ret = await inst.exec(run.args); } catch (e) { ret = -1; ffLog.push(String((e && e.message) || e)); }
     if (ret === 0) {
       try {
-        data = await inst.readFile(run.out);
-        if (data && data.length) { chosen = run; break; }
-      } catch (e) { /* try next */ }
+        const out = await inst.readFile(run.out);
+        // a non-empty result only — a "successful" run can still yield an empty file
+        if (out && out.length > 1024) { data = out; chosen = run; break; }
+        failures.push(run.name + ': пустой результат');
+      } catch (e) { failures.push(run.name + ': файл не создан'); }
+    } else {
+      failures.push(run.name + ' (код ' + ret + '): ' + ffLog.slice(-3).join(' | '));
     }
-    lastErr = 'ffmpeg код ' + ret + ': ' + ffLog.slice(-6).join(' | ');
     try { await inst.deleteFile(run.out); } catch (e) {}
   }
+  const lastErr = failures.join('  ||  ');
 
   // free FS
   try { if (vName) await inst.deleteFile(vName); await inst.deleteFile(aName); } catch (e) {}
@@ -144,8 +163,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     acc.filename = msg.filename || 'video.mp4';
     acc.transcode = !!msg.transcode;
     acc.format = msg.format || 'mp4';
-    acc.start = msg.start || 0;
-    acc.end = msg.end || 0;
+    acc.trimStart = msg.trimStart || 0;
+    acc.trimDuration = msg.trimDuration || 0;
     // warm up ffmpeg while chunks stream in
     getFF().catch(() => {});
     sendResponse({ ok: true });

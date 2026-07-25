@@ -264,7 +264,7 @@
     };
     chrome.runtime.onMessage.addListener(onProg);
     try {
-      const result = await download({ height, format, end }, (d) => {
+      const result = await download({ height, format, start, end }, (d) => {
         t.set('Загрузка сегментов ' + label + '… ' + Math.round(d.progress * 100) + '%', d.progress * 0.5);
       });
       t.set(isMp3 ? 'Кодирование MP3…'
@@ -274,13 +274,23 @@
       const filename = safeName(info.title) + (isMp3 ? '' : ' [' + height + 'p]') +
         fragSuffix(start, end, duration) + ext;
 
+      // Capture starts at a segment boundary at or before `start`, so trimming must be
+      // RELATIVE to the captured file — ffmpeg's -ss counts from the file's own start,
+      // not from the video's absolute timeline.
+      const capturedFrom = typeof result.capturedFrom === 'number' ? result.capturedFrom : start;
+      const trimStart = Math.max(0, start - capturedFrom);
+      const trimDuration = Math.max(0, end - start);
+
       const res = await muxViaOffscreen({
         format,
         video: isMp3 ? null : result._v,
         audio: result._a,
         videoMime: result.video && result.video.mime,
         audioMime: result.audio && result.audio.mime,
-        filename, transcode: doTranscode, start, end,
+        filename, transcode: doTranscode,
+        trimStart,
+        // only limit duration when a real fragment was requested
+        trimDuration: (start > 0 || end < duration - 0.5) ? trimDuration : 0,
       });
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
@@ -311,7 +321,8 @@
     await chrome.runtime.sendMessage({
       t: 'ytdl-begin', filename: job.filename, format: job.format,
       videoMime: job.videoMime, audioMime: job.audioMime,
-      transcode: !!job.transcode, start: job.start, end: job.end,
+      transcode: !!job.transcode,
+      trimStart: job.trimStart || 0, trimDuration: job.trimDuration || 0,
     });
     const sendTrack = async (name, buf) => {
       if (!buf) return;
