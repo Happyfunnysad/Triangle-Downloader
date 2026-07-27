@@ -15,6 +15,11 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
 - **Clip selection** — "start — end" fields in the menu (default `0:00:00` … full length).
   **Only the selected range is fetched**, not the whole video: e.g. 10 seconds out of an
   hour-long video download in a couple of seconds.
+  Clips **up to 60 seconds** are cut exactly at the requested time (a short re-encode,
+  roughly as long as the clip itself). Longer ones are saved instantly, but the start is
+  aligned to the nearest keyframe (it can be a couple of seconds early) — an exact start is
+  otherwise impossible: frames between keyframes are stored as differences and cannot be
+  decoded on their own.
 - **Subtitles** — `.txt` without timecodes. Prefers Russian, otherwise any available language.
 - **Video format** — "Fast" (VP9 in mp4, no re‑encoding, seconds) or "H.264" (re‑encode for
   compatibility with older players, slow).

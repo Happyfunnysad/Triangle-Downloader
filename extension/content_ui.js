@@ -3,6 +3,10 @@
 // then streams the captured tracks to the offscreen ffmpeg worker for muxing.
 (function () {
   const BTN_ID = 'ytdl-btn';
+  // Clips up to this length get an exact (re-encoded) cut; longer ones are copied
+  // instantly and start at the keyframe before the requested point. Re-encoding costs
+  // roughly the clip's own length at 1080p, so ~1 minute is a comfortable ceiling.
+  const EXACT_CUT_MAX_SEC = 60;
   let reqSeq = 1;
   const pending = new Map();
 
@@ -254,11 +258,10 @@
     t.set('Готовлю ' + label + ' — загрузка сегментов…', 0.02);
 
     const { transcode = false } = await chrome.storage.local.get('transcode');
-    const doTranscode = isMp3 ? true : !!transcode; // mp3 always encodes
 
     const onProg = (msg) => {
       if (msg && msg.t === 'ytdl-progress') {
-        t.set((isMp3 ? 'Кодирование MP3… ' : 'Перекодирование в H.264/AAC… ') +
+        t.set((isMp3 ? 'Кодирование MP3… ' : 'Точная обрезка (перекодирование)… ') +
           Math.round(msg.value * 100) + '%', 0.55 + msg.value * 0.45);
       }
     };
@@ -267,8 +270,6 @@
       const result = await download({ height, format, start, end }, (d) => {
         t.set('Загрузка сегментов ' + label + '… ' + Math.round(d.progress * 100) + '%', d.progress * 0.5);
       });
-      t.set(isMp3 ? 'Кодирование MP3…'
-        : (transcode ? 'Готовлю перекодирование (может занять дольше ролика)…' : 'Склейка дорожек…'), 0.55);
 
       const ext = isMp3 ? '.mp3' : '.mp4';
       const filename = safeName(info.title) + (isMp3 ? '' : ' [' + height + 'p]') +
@@ -280,6 +281,22 @@
       const capturedFrom = typeof result.capturedFrom === 'number' ? result.capturedFrom : start;
       const trimStart = Math.max(0, start - capturedFrom);
       const trimDuration = Math.max(0, end - start);
+      const isFragment = start > 0 || end < duration - 0.5;
+
+      // A copied stream can only start on a keyframe, so an exact start needs
+      // re-encoding. That costs roughly the clip's own length, so we only do it
+      // automatically for short clips; longer ones stay instant and start at the
+      // keyframe just before the requested point.
+      const needsExactCut = isFragment && trimStart > 0.3;
+      const shortEnough = trimDuration > 0 && trimDuration <= EXACT_CUT_MAX_SEC;
+      const exactCut = !isMp3 && needsExactCut && shortEnough;
+      const doTranscode = isMp3 ? true : (!!transcode || exactCut);
+      const alignedStart = !isMp3 && needsExactCut && !doTranscode;
+
+      t.set(isMp3 ? 'Кодирование MP3…'
+        : (exactCut ? 'Точная обрезка фрагмента (перекодирование)…'
+          : (transcode ? 'Перекодирование в H.264 (может занять дольше ролика)…'
+            : 'Склейка дорожек…')), 0.55);
 
       const res = await muxViaOffscreen({
         format,
@@ -287,15 +304,16 @@
         audio: result._a,
         videoMime: result.video && result.video.mime,
         audioMime: result.audio && result.audio.mime,
-        filename, transcode: doTranscode,
+        filename, transcode: doTranscode, quickEncode: exactCut && !transcode,
         trimStart,
         // only limit duration when a real fragment was requested
-        trimDuration: (start > 0 || end < duration - 0.5) ? trimDuration : 0,
+        trimDuration: isFragment ? trimDuration : 0,
       });
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
-      t.set('Готово: ' + (res.filename || filename), 1);
-      t.hide(4000);
+      t.set('Готово: ' + (res.filename || filename) +
+        (alignedStart ? ' — начало выровнено по опорному кадру' : ''), 1);
+      t.hide(alignedStart ? 7000 : 4000);
     } catch (err) {
       t.set('Ошибка: ' + (err.message || err), 1);
       t.hide(6000);
@@ -321,7 +339,7 @@
     await chrome.runtime.sendMessage({
       t: 'ytdl-begin', filename: job.filename, format: job.format,
       videoMime: job.videoMime, audioMime: job.audioMime,
-      transcode: !!job.transcode,
+      transcode: !!job.transcode, quickEncode: !!job.quickEncode,
       trimStart: job.trimStart || 0, trimDuration: job.trimDuration || 0,
     });
     const sendTrack = async (name, buf) => {

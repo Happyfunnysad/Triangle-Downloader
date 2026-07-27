@@ -73,16 +73,24 @@ async function finalize() {
   // Passing an absolute position produced an empty file (0 bytes of output).
   const trimStart = Math.max(0, Number(acc.trimStart) || 0);
   const trimDuration = Math.max(0, Number(acc.trimDuration) || 0);
-  const seek = trimStart > 0.05 ? ['-ss', trimStart.toFixed(3)] : [];
-  const limit = trimDuration > 0.05 ? ['-t', trimDuration.toFixed(3)] : [];
+  // Re-encoding cuts frame-accurately, so it seeks to the exact requested point.
+  // A stream copy cannot: video can only start on a keyframe while audio would be cut
+  // precisely, which leaves the lead-in silent. So the copy path seeks nothing and just
+  // limits the length — both tracks start together at the keyframe before the request.
+  const exact = !!acc.transcode;
+  const seek = exact && trimStart > 0.05 ? ['-ss', trimStart.toFixed(3)] : [];
+  const limit = trimDuration > 0.05
+    ? ['-t', (exact ? trimDuration : trimStart + trimDuration).toFixed(3)]
+    : [];
   const inV = (s) => (vName ? [...s, '-i', vName] : []);
   const inA = (s) => [...s, '-i', aName];
-  // Stream copy can only cut on keyframes, so a trimmed copy really starts at the
-  // keyframe BEFORE the requested point. MP4 solves this with an edit list, which
-  // ffmpeg writes by default — but `-avoid_negative_ts make_zero` overrides that and
-  // bakes the lead-in into the timeline (the clip then starts seconds too early).
-  // So: normalize timestamps only when we are NOT trimming.
-  const ZERO = seek.length ? [] : ['-avoid_negative_ts', 'make_zero'];
+  // Stream copy can only cut on keyframes, so a trimmed copy starts at the keyframe
+  // BEFORE the requested point. MP4 can hide that lead-in with an edit list, but the
+  // skipped frames stay inside the file and players that take the duration from the
+  // media track then show a frozen tail at the end. So the copy path always normalizes
+  // timestamps (lead-in becomes ordinary content) and exact cuts are produced by
+  // re-encoding instead — see the "exact cut" decision in content_ui.js.
+  const ZERO = ['-avoid_negative_ts', 'make_zero'];
 
   const runs = [];
   if (isMp3) {
@@ -91,11 +99,14 @@ async function finalize() {
       args: [...inA(seek), ...limit, '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
     });
   } else if (acc.transcode) {
-    // Slow path: re-encode to H.264 + AAC so the file plays everywhere.
+    // Re-encode to H.264 + AAC. An automatic exact cut of a short clip favours speed
+    // (ultrafast is ~2× quicker at 1080p); the user-selected compatibility mode keeps
+    // the better-compressing preset.
+    const preset = acc.quickEncode ? 'ultrafast' : 'veryfast';
     runs.push({
       name: 'h264', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
       args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', preset, '-crf', '20', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', 'out.mp4'],
     });
   } else {
@@ -115,13 +126,11 @@ async function finalize() {
           '-movflags', '+faststart', 'out.mp4'],
       });
     }
-    // Last resort if mp4 refuses these codecs. WebM has no edit lists, so a trimmed
-    // copy here keeps the keyframe lead-in — acceptable for a fallback that
-    // practically never runs.
+    // Last resort if mp4 refuses these codecs.
     runs.push({
       name: 'webm-copy', out: 'out.webm', type: 'video/webm', ext: '.webm',
       args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c', 'copy', '-avoid_negative_ts', 'make_zero', 'out.webm'],
+        '-c', 'copy', ...ZERO, 'out.webm'],
     });
   }
 
@@ -171,6 +180,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     acc.filename = msg.filename || 'video.mp4';
     acc.transcode = !!msg.transcode;
     acc.format = msg.format || 'mp4';
+    acc.quickEncode = !!msg.quickEncode;
     acc.trimStart = msg.trimStart || 0;
     acc.trimDuration = msg.trimDuration || 0;
     // warm up ffmpeg while chunks stream in
