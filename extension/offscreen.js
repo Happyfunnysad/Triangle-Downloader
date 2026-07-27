@@ -77,7 +77,12 @@ async function finalize() {
   const limit = trimDuration > 0.05 ? ['-t', trimDuration.toFixed(3)] : [];
   const inV = (s) => (vName ? [...s, '-i', vName] : []);
   const inA = (s) => [...s, '-i', aName];
-  const ZERO = ['-avoid_negative_ts', 'make_zero'];
+  // Stream copy can only cut on keyframes, so a trimmed copy really starts at the
+  // keyframe BEFORE the requested point. MP4 solves this with an edit list, which
+  // ffmpeg writes by default — but `-avoid_negative_ts make_zero` overrides that and
+  // bakes the lead-in into the timeline (the clip then starts seconds too early).
+  // So: normalize timestamps only when we are NOT trimming.
+  const ZERO = seek.length ? [] : ['-avoid_negative_ts', 'make_zero'];
 
   const runs = [];
   if (isMp3) {
@@ -106,14 +111,17 @@ async function finalize() {
       runs.push({
         name: 'mp4-copy-untrimmed', out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
         args: [...inV([]), ...inA([]), '-map', '0:v:0', '-map', '1:a:0',
-          '-c', 'copy', '-strict', '-2', ...ZERO, '-movflags', '+faststart', 'out.mp4'],
+          '-c', 'copy', '-strict', '-2', '-avoid_negative_ts', 'make_zero',
+          '-movflags', '+faststart', 'out.mp4'],
       });
     }
-    // If mp4 refuses these codecs, fall back to native WebM copy.
+    // Last resort if mp4 refuses these codecs. WebM has no edit lists, so a trimmed
+    // copy here keeps the keyframe lead-in — acceptable for a fallback that
+    // practically never runs.
     runs.push({
       name: 'webm-copy', out: 'out.webm', type: 'video/webm', ext: '.webm',
       args: [...inV(seek), ...inA(seek), '-map', '0:v:0', '-map', '1:a:0', ...limit,
-        '-c', 'copy', ...ZERO, 'out.webm'],
+        '-c', 'copy', '-avoid_negative_ts', 'make_zero', 'out.webm'],
     });
   }
 
