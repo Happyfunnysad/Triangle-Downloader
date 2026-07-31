@@ -1,23 +1,25 @@
 // offscreen.js — runs ffmpeg.wasm in an extension DOM context (a service worker
-// can't host ffmpeg). Receives the two captured tracks in chunks, transcodes them
-// into a universally-playable H.264/AAC MP4, and hands the result to the background
-// for saving. The captured tracks are whatever the player streamed (typically AV1
-// or VP9 video + Opus audio), so this re-encodes rather than remuxes.
+// can't host ffmpeg). Receives captured tracks in chunks, cuts SponsorBlock
+// segments, muxes/merges, and hands the result to the background for saving.
 //
-// SponsorBlock: `acc.sb` holds [{start,end,category}] intervals (absolute video
-// time) to remove from the output.
-//   * mp3 / H.264 modes already re-encode → we drop the intervals with
-//     aselect/select filters (frame-accurate).
-//   * fast copy mode can't filter → we stream-copy each kept span into its own
-//     part file and join them with the concat demuxer (cut points land on the
-//     nearest keyframe, so they can be off by a couple of seconds).
+// Two modes:
+//   * single: one begin/chunk/finalize job (the classic flow);
+//   * parallel: several tabs each deliver a fragment (par-begin/par-chunk/par-frag),
+//     then the background asks for a merge (par-merge) — fragments are trimmed into
+//     pieces (SponsorBlock intervals removed), concatenated in order and saved.
+//
+// Capture may start mid-video, so every captured file begins at an arbitrary
+// timestamp. probeStart() reads the real start time from the ffmpeg log, and all
+// -ss seeks are computed relative to it (ffmpeg treats input -ss as relative to
+// the file's start_time).
 
 const { FFmpeg } = FFmpegWASM;
 
 let ff = null;
 let ffLoading = null;
 const acc = { video: [], audio: [], videoMime: '', audioMime: '', filename: 'video.mp4', sb: [] };
-const ffLog = []; // ring buffer of recent ffmpeg log lines for error reporting
+const par = Object.create(null); // task -> { frags: idx -> {video,audio,mimes,vBytes,aBytes} }
+const ffLog = []; // ring buffer of recent ffmpeg log lines
 
 async function getFF() {
   if (ff) return ff;
@@ -29,7 +31,7 @@ async function getFF() {
     });
     inst.on('log', ({ message }) => {
       ffLog.push(message);
-      if (ffLog.length > 40) ffLog.shift();
+      if (ffLog.length > 60) ffLog.shift();
     });
     const base = chrome.runtime.getURL('vendor/ffmpeg/');
     await inst.load({ coreURL: base + 'ffmpeg-core.js', wasmURL: base + 'ffmpeg-core.wasm' });
@@ -57,10 +59,18 @@ function extFor(mime) {
   if (/mp4/i.test(mime)) return 'mp4';
   return 'bin';
 }
+async function rm(inst, name) { try { await inst.deleteFile(name); } catch (e) {} }
+
+// Real start timestamp of a captured file (mid-video captures start at ~capStart).
+// `ffmpeg -i file` exits with an error but prints "Duration: ..., start: X" first.
+async function probeStart(inst, name) {
+  ffLog.length = 0;
+  try { await inst.exec(['-hide_banner', '-i', name]); } catch (e) {}
+  const m = ffLog.join('\n').match(/start:\s*(-?[\d.]+)/);
+  return m ? Math.max(0, parseFloat(m[1])) : 0;
+}
 
 // ---- SponsorBlock interval math -------------------------------------------
-// Clip the raw segments to [start, end], drop tiny ones, sort, merge overlaps.
-// Returns merged removal intervals in ABSOLUTE video time.
 function mergeCuts(segs, start, end) {
   const clipped = (segs || [])
     .map((s) => [Math.max(start, Number(s.start) || 0), Math.min(end, Number(s.end) || 0)])
@@ -75,8 +85,6 @@ function mergeCuts(segs, start, end) {
   return merged;
 }
 
-// Invert removal intervals into the spans to KEEP within [start, end].
-// `end` may be Infinity (no explicit fragment end) → last span gets end=null.
 function keepList(cuts, start, end) {
   const keep = [];
   let cur = start;
@@ -89,15 +97,13 @@ function keepList(cuts, start, end) {
   return keep;
 }
 
-// select/aselect expression that drops the removal intervals; times must already
-// be RELATIVE to the input (-ss shifts timestamps to 0).
 function dropExpr(relCuts) {
   return relCuts.map(([a, b]) => 'between(t,' + a.toFixed(3) + ',' + b.toFixed(3) + ')').join('+');
 }
 
+// ---- single mode -----------------------------------------------------------
 // Fast mode with SponsorBlock: stream-copy each kept span, then concat.
-// Tries mp4 first, falls back to webm (same as the normal fast path).
-async function copyCutConcat(inst, vName, aName, keep) {
+async function copyCutConcat(inst, vName, aName, keep, sV, sA) {
   const variants = [
     { ext: 'mp4', type: 'video/mp4', extra: ['-strict', '-2'], concatExtra: ['-movflags', '+faststart'] },
     { ext: 'webm', type: 'video/webm', extra: [], concatExtra: [] },
@@ -105,10 +111,7 @@ async function copyCutConcat(inst, vName, aName, keep) {
   let lastErr = '';
   for (const v of variants) {
     const made = [];
-    const clean = async () => {
-      for (const f of made) { try { await inst.deleteFile(f); } catch (e) {} }
-      try { await inst.deleteFile('list.txt'); } catch (e) {}
-    };
+    const clean = async () => { for (const f of made) await rm(inst, f); await rm(inst, 'list.txt'); };
     let ok = true;
     for (let i = 0; i < keep.length; i++) {
       const [a, b] = keep[i];
@@ -116,7 +119,8 @@ async function copyCutConcat(inst, vName, aName, keep) {
       const t = b != null ? ['-t', String(Math.max(0.1, b - a))] : [];
       ffLog.length = 0;
       const ret = await inst.exec([
-        '-ss', String(a), '-i', vName, '-ss', String(a), '-i', aName,
+        '-ss', String(Math.max(0, a - sV)), '-i', vName,
+        '-ss', String(Math.max(0, a - sA)), '-i', aName,
         '-map', '0:v:0', '-map', '1:a:0', ...t, '-c', 'copy', ...v.extra, part,
       ]);
       if (ret !== 0) {
@@ -126,8 +130,7 @@ async function copyCutConcat(inst, vName, aName, keep) {
       made.push(part);
     }
     if (ok) {
-      const list = made.map((p) => "file '" + p + "'").join('\n');
-      await inst.writeFile('list.txt', new TextEncoder().encode(list));
+      await inst.writeFile('list.txt', new TextEncoder().encode(made.map((p) => "file '" + p + "'").join('\n')));
       ffLog.length = 0;
       const out = 'out.' + v.ext;
       const ret = await inst.exec(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', ...v.concatExtra, out]);
@@ -135,14 +138,13 @@ async function copyCutConcat(inst, vName, aName, keep) {
         try {
           const data = await inst.readFile(out);
           if (data && data.length) {
-            await clean();
-            try { await inst.deleteFile(out); } catch (e) {}
+            await clean(); await rm(inst, out);
             return { data, chosen: { out, type: v.type, ext: '.' + v.ext }, lastErr: '' };
           }
         } catch (e) {}
       }
       lastErr = 'ffmpeg код ' + ret + ' (склейка ' + v.ext + '): ' + ffLog.slice(-6).join(' | ');
-      try { await inst.deleteFile(out); } catch (e) {}
+      await rm(inst, out);
     }
     await clean();
   }
@@ -154,8 +156,6 @@ async function finalize() {
   const isMp3 = acc.format === 'mp3';
   const aName = 'a.' + extFor(acc.audioMime);
 
-  // concat + release the chunk arrays immediately — on long videos the tracks are
-  // hundreds of MB, and holding chunks + concat + ffmpeg FS at once risks OOM
   const aBytes = concat(acc.audio);
   acc.audio = [];
   if (!aBytes.length) throw new Error('пустые данные аудио');
@@ -170,43 +170,42 @@ async function finalize() {
     await inst.writeFile(vName, vBytes);
   }
 
-  // fragment trim: -ss before each input (keyframe seek), -t as output duration
+  // capture may begin mid-video → learn the real file start times
+  const sA = await probeStart(inst, aName);
+  const sV = vName ? await probeStart(inst, vName) : 0;
+
   const start = Math.max(0, Number(acc.start) || 0);
   const end = Number(acc.end) || 0;
   const effEnd = end > start ? end : Infinity;
   const dur = isFinite(effEnd) ? effEnd - start : 0;
-  const seek = start > 0 ? ['-ss', String(start)] : [];
   const limit = dur > 0 ? ['-t', String(dur)] : [];
-  const inV = vName ? [...seek, '-i', vName] : [];
-  const inA = [...seek, '-i', aName];
+  const seekA = start - sA > 0.2 ? ['-ss', String(start - sA)] : [];
+  const seekV = start - sV > 0.2 ? ['-ss', String(start - sV)] : [];
+  const inV = vName ? [...seekV, '-i', vName] : [];
+  const inA = [...seekA, '-i', aName];
 
-  // SponsorBlock removal intervals (absolute), and relative to the -ss shift
   let cuts = mergeCuts(acc.sb, start, effEnd);
   let keep = keepList(cuts, start, effEnd);
-  if (!keep.length) { cuts = []; keep = keepList([], start, effEnd); } // everything flagged → keep as is
+  if (!keep.length) { cuts = []; keep = keepList([], start, effEnd); }
   const relCuts = cuts.map(([a, b]) => [Math.max(0, a - start), b - start]);
   const expr = relCuts.length ? dropExpr(relCuts) : '';
 
   let data = null, chosen = null, lastErr = '';
 
-  // Fast copy mode with cuts: per-span copy + concat (no re-encode).
   if (!isMp3 && !acc.transcode && cuts.length) {
-    ({ data, chosen, lastErr } = await copyCutConcat(inst, vName, aName, keep));
+    ({ data, chosen, lastErr } = await copyCutConcat(inst, vName, aName, keep, sV, sA));
     if (!data) console.warn('[Triangle] вырезание в режиме copy не удалось, скачиваю без вырезания:', lastErr);
   }
 
   if (!data) {
     const runs = [];
     if (isMp3) {
-      const af = expr
-        ? ['-af', "aselect='not(" + expr + ")',asetpts=N/SR/TB"]
-        : [];
+      const af = expr ? ['-af', "aselect='not(" + expr + ")',asetpts=N/SR/TB"] : [];
       runs.push({
         out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
         args: [...inA, ...limit, '-vn', ...af, '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
       });
     } else if (acc.transcode) {
-      // Slow path: re-encode to H.264 + AAC so the file plays everywhere.
       const maps = expr
         ? ['-filter_complex',
            "[0:v]select='not(" + expr + ")',setpts=N/FRAME_RATE/TB[v];" +
@@ -220,14 +219,11 @@ async function finalize() {
           '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', 'out.mp4'],
       });
     } else {
-      // Fast path: stream-copy the original tracks (VP9/Opus) into mp4 (seconds).
-      // (Also the fallback when SponsorBlock cutting failed above.)
       runs.push({
         out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
         args: [...inV, ...inA, '-map', '0:v:0', '-map', '1:a:0', ...limit,
           '-c', 'copy', '-strict', '-2', '-movflags', '+faststart', 'out.mp4'],
       });
-      // If mp4 refuses these codecs, fall back to native WebM copy.
       runs.push({
         out: 'out.webm', type: 'video/webm', ext: '.webm',
         args: [...inV, ...inA, '-map', '0:v:0', '-map', '1:a:0', ...limit, '-c', 'copy', 'out.webm'],
@@ -244,26 +240,138 @@ async function finalize() {
         } catch (e) { /* try next */ }
       }
       lastErr = 'ffmpeg код ' + ret + ': ' + ffLog.slice(-6).join(' | ');
-      try { await inst.deleteFile(run.out); } catch (e) {}
+      await rm(inst, run.out);
     }
-    if (chosen) { try { await inst.deleteFile(chosen.out); } catch (e) {} }
+    if (chosen) await rm(inst, chosen.out);
   }
 
-  // free FS
-  try { if (vName) await inst.deleteFile(vName); await inst.deleteFile(aName); } catch (e) {}
+  await rm(inst, aName);
+  if (vName) await rm(inst, vName);
   acc.video = []; acc.audio = []; acc.sb = [];
 
   if (!chosen) throw new Error(lastErr || 'ffmpeg не собрал файл');
+  return saveBlob(data, acc.filename, chosen);
+}
 
-  const filename = acc.filename.replace(/\.(mp4|webm|mp3)$/i, '') + chosen.ext;
+async function saveBlob(data, baseName, chosen) {
+  const filename = (baseName || 'video').replace(/\.(mp4|webm|mp3)$/i, '') + chosen.ext;
   const blob = new Blob([data.buffer], { type: chosen.type });
   const url = URL.createObjectURL(blob);
   const res = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename });
-  // keep the blob alive briefly so chrome.downloads can read it, then release
   setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
-  return res && res.ok ? { ok: true, filename } : { ok: false, error: (res && res.error) || 'save failed' };
+  if (!res || !res.ok) throw new Error((res && res.error) || 'save failed');
+  return filename;
 }
 
+// ---- parallel merge --------------------------------------------------------
+async function parMerge(msg) {
+  const inst = await getFF();
+  const state = par[msg.task];
+  if (!state) throw new Error('нет данных задачи');
+  const isMp3 = msg.format === 'mp3';
+
+  const cuts = mergeCuts(msg.sb, msg.start, msg.end);
+  let keep = keepList(cuts, msg.start, msg.end);
+  if (!keep.length) keep = [[msg.start, msg.end]];
+
+  // output order: intersect keep spans with fragment ranges → pieces
+  const pieces = [];
+  for (const [a, b] of keep) {
+    for (const fr of msg.frags) {
+      const x = Math.max(a, fr.s), y = Math.min(b == null ? msg.end : b, fr.e);
+      if (y - x > 0.3) pieces.push({ frag: fr.idx, x, y });
+    }
+  }
+  pieces.sort((p, q) => p.x - q.x);
+  if (!pieces.length) throw new Error('нечего собирать');
+
+  const pieceNames = new Array(pieces.length);
+  let doneCount = 0;
+  const prog = () => {
+    try { chrome.runtime.sendMessage({ t: 'ytdl-par-merge-prog', task: msg.task, pct: doneCount / (pieces.length + 1) }); } catch (e) {}
+  };
+
+  // per fragment: write raw tracks once, cut all its pieces, free the raw data
+  for (const fr of msg.frags) {
+    const mine = pieces.map((p, i) => ({ p, i })).filter((z) => z.p.frag === fr.idx);
+    if (!mine.length) continue;
+    const d = state.frags[fr.idx];
+    if (!d || !d.aName || (!isMp3 && !d.vName)) throw new Error('нет данных фрагмента ' + fr.idx);
+
+    // already written into the ffmpeg FS when the fragment arrived
+    const aN = d.aName;
+    const vN = isMp3 ? null : d.vName;
+
+    const sA = await probeStart(inst, aN);
+    const sV = vN ? await probeStart(inst, vN) : 0;
+
+    for (const z of mine) {
+      const { x, y } = z.p;
+      const len = String(Math.max(0.1, y - x));
+      let out, args;
+      if (isMp3) {
+        out = 'p' + z.i + '.webm';
+        args = ['-ss', String(Math.max(0, x - sA)), '-i', aN, '-t', len, '-vn', '-c', 'copy', out];
+      } else if (msg.transcode) {
+        out = 'p' + z.i + '.mp4';
+        args = ['-ss', String(Math.max(0, x - sV)), '-i', vN, '-ss', String(Math.max(0, x - sA)), '-i', aN,
+          '-map', '0:v:0', '-map', '1:a:0', '-t', len,
+          '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+          '-c:a', 'aac', '-b:a', '160k', out];
+      } else {
+        out = 'p' + z.i + '.webm';
+        args = ['-ss', String(Math.max(0, x - sV)), '-i', vN, '-ss', String(Math.max(0, x - sA)), '-i', aN,
+          '-map', '0:v:0', '-map', '1:a:0', '-t', len, '-c', 'copy', out];
+      }
+      ffLog.length = 0;
+      const ret = await inst.exec(args);
+      if (ret !== 0) throw new Error('ffmpeg код ' + ret + ' (кусок ' + z.i + '): ' + ffLog.slice(-6).join(' | '));
+      pieceNames[z.i] = out;
+      doneCount++; prog();
+    }
+    await rm(inst, aN);
+    if (d.vName) await rm(inst, d.vName);
+    d.aName = null; d.vName = null;
+  }
+
+  // final concat in piece order
+  await inst.writeFile('list.txt', new TextEncoder().encode(pieceNames.map((p) => "file '" + p + "'").join('\n')));
+  const attempts = isMp3
+    ? [{ out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
+         args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'] }]
+    : msg.transcode
+      ? [{ out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
+           args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-movflags', '+faststart', 'out.mp4'] }]
+      : [
+          { out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
+            args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-strict', '-2', '-movflags', '+faststart', 'out.mp4'] },
+          { out: 'out.webm', type: 'video/webm', ext: '.webm',
+            args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'out.webm'] },
+        ];
+
+  let data = null, chosen = null, lastErr = '';
+  for (const run of attempts) {
+    ffLog.length = 0;
+    const ret = await inst.exec(run.args);
+    if (ret === 0) {
+      try {
+        data = await inst.readFile(run.out);
+        if (data && data.length) { chosen = run; break; }
+      } catch (e) {}
+    }
+    lastErr = 'ffmpeg код ' + ret + ': ' + ffLog.slice(-6).join(' | ');
+    await rm(inst, run.out);
+  }
+
+  for (const p of pieceNames) if (p) await rm(inst, p);
+  await rm(inst, 'list.txt');
+  if (chosen) await rm(inst, chosen.out);
+
+  if (!chosen) throw new Error(lastErr || 'склейка фрагментов не удалась');
+  return saveBlob(data, msg.filename, chosen);
+}
+
+// ---- message handlers ------------------------------------------------------
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg.t !== 'string') return;
 
@@ -271,6 +379,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ pong: true });
     return; // sync
   }
+
+  // ---- single mode ----
   if (msg.t === 'ytdl-begin') {
     acc.video = []; acc.audio = [];
     acc.videoMime = msg.videoMime || '';
@@ -281,7 +391,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     acc.start = msg.start || 0;
     acc.end = msg.end || 0;
     acc.sb = Array.isArray(msg.sb) ? msg.sb : [];
-    // warm up ffmpeg while chunks stream in
     getFF().catch(() => {});
     sendResponse({ ok: true });
     return; // sync
@@ -297,9 +406,81 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.t === 'ytdl-finalize') {
     finalize()
-      .then((r) => sendResponse(r))
+      .then((filename) => sendResponse({ ok: true, filename }))
       .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
     return true; // async
+  }
+
+  // ---- parallel mode ----
+  if (msg.t === 'ytdl-par-begin') {
+    const st = par[msg.task] || (par[msg.task] = { frags: Object.create(null) });
+    const prev = st.frags[msg.idx];
+    if (prev && ff) { // a retried fragment — throw away the previous attempt
+      if (prev.aName) rm(ff, prev.aName);
+      if (prev.vName) rm(ff, prev.vName);
+    }
+    st.frags[msg.idx] = {
+      video: [], audio: [], aName: null, vName: null,
+      videoMime: msg.videoMime || '', audioMime: msg.audioMime || '',
+    };
+    getFF().catch(() => {});
+    sendResponse({ ok: true });
+    return; // sync
+  }
+  if (msg.t === 'ytdl-par-chunk') {
+    try {
+      const f = par[msg.task] && par[msg.task].frags[msg.idx];
+      if (!f) throw new Error('нет фрагмента ' + msg.idx);
+      f[msg.track].push(b64decode(msg.b64));
+      sendResponse({ ok: true });
+    } catch (e) {
+      sendResponse({ ok: false, error: String(e) });
+    }
+    return; // sync
+  }
+  if (msg.t === 'ytdl-par-frag') {
+    // Move the fragment straight into the ffmpeg filesystem and drop the JS
+    // buffers: with 4 workers in flight, holding every fragment as JS arrays AND
+    // as an ffmpeg copy is what pushes the wasm heap over its ~2 GB ceiling.
+    (async () => {
+      const f = par[msg.task] && par[msg.task].frags[msg.idx];
+      if (!f) throw new Error('нет фрагмента ' + msg.idx);
+      const inst = await getFF();
+      const aB = concat(f.audio); f.audio = [];
+      const vB = f.video.length ? concat(f.video) : null; f.video = [];
+      if (!aB.length) throw new Error('пустое аудио фрагмента ' + msg.idx);
+      f.aName = 'fa' + msg.idx + '.' + extFor(f.audioMime);
+      await inst.writeFile(f.aName, aB);
+      if (vB) {
+        f.vName = 'fv' + msg.idx + '.' + extFor(f.videoMime);
+        await inst.writeFile(f.vName, vB);
+      }
+      return { ok: true };
+    })()
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true; // async
+  }
+  if (msg.t === 'ytdl-par-drop') {
+    const st = par[msg.task];
+    delete par[msg.task];
+    sendResponse({ ok: true });
+    if (st && ff) {
+      for (const k of Object.keys(st.frags)) {
+        const f = st.frags[k];
+        if (f.aName) rm(ff, f.aName);
+        if (f.vName) rm(ff, f.vName);
+      }
+    }
+    return; // sync
+  }
+  if (msg.t === 'ytdl-par-merge') {
+    sendResponse({ ok: true }); // ack now; the result arrives as 'ytdl-par-merged'
+    parMerge(msg)
+      .then((filename) => chrome.runtime.sendMessage({ t: 'ytdl-par-merged', task: msg.task, ok: true, filename }))
+      .catch((e) => chrome.runtime.sendMessage({ t: 'ytdl-par-merged', task: msg.task, ok: false, error: String((e && e.message) || e) }))
+      .finally(() => { delete par[msg.task]; });
+    return; // sync (ack already sent)
   }
   // other message types belong to the background; ignore.
 });

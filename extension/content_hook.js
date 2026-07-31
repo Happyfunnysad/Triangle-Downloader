@@ -181,7 +181,12 @@
     const v = video();
     const dur = v.duration;
     if (!isFinite(dur) || dur <= 0) throw new Error('duration unknown');
+    // capture RANGE [capStart, capEnd] — the player fetches from the seek position,
+    // so starting mid-video only downloads that part (the captured file then begins
+    // at the nearest segment boundary at-or-before capStart; ffmpeg trims later)
+    const capStart = Math.max(0, Math.min(Number(opts.start) || 0, dur - 2));
     const capEnd = Math.min(opts.end && opts.end > 0 ? opts.end : dur, dur);
+    if (capEnd - capStart < 1) throw new Error('пустой диапазон захвата');
     const capId = vidId();
 
     const prev = { paused: v.paused, rate: v.playbackRate, time: v.currentTime, muted: v.muted };
@@ -196,19 +201,20 @@
     const goTo = (t) => { lastReq = t; seekVia(t); };
 
     // Order matters:
-    //  1) switch to a low quality and seek to a NON-ZERO position (so position 0 is
-    //     left unbuffered). Seeking to 0 later is then a real jump that forces BOTH
-    //     tracks to re-fetch from the start — important because the audio itag is the
+    //  1) switch to a low quality and seek AWAY from capStart (so capStart is left
+    //     unbuffered). Seeking to capStart later is then a real jump that forces BOTH
+    //     tracks to re-fetch from there — important because the audio itag is the
     //     same Opus at every quality, so a quality switch alone won't re-init audio.
-    //  2) start recording, switch to the target quality, then seek to 0.
+    //  2) start recording, switch to the target quality, then seek to capStart.
+    const preSeek = (capStart + 40 < dur) ? capStart + 35 : Math.max(0, capStart - 35);
     setQualityRaw(preQ);
     await sleep(500);
-    goTo(Math.min(35, dur * 0.4));
+    goTo(preSeek);
     await sleep(700);
     resetTracks();
     store.capturing = true;
     setQualityRaw(targetQ);
-    goTo(0);
+    goTo(capStart);
     await sleep(500);
 
     // wait until the tracks we need have their init before entering the capture loop
@@ -227,7 +233,8 @@
       }
       return t;
     };
-    let cursor = 0, stall = 0, rescues = 0;
+    const span = capEnd - capStart;
+    let cursor = capStart, stall = 0, rescues = 0;
     const started = Date.now();
     try {
       try { v.pause(); } catch (e) {}
@@ -258,7 +265,7 @@
         }
 
         const edge = bufferedEndAt(cursor);
-        onProgress(Math.min(0.99, edge / capEnd));
+        onProgress(Math.min(0.99, Math.max(0, edge - capStart) / span));
         if (edge >= capEnd - 0.6) break;                 // fully buffered → captured
 
         if (edge > cursor + 0.3) {                       // window extended → hop to the edge
@@ -410,7 +417,7 @@
   // ---- bridge to the isolated-world UI script ------------------------------
   window.addEventListener('message', async (ev) => {
     if (ev.source !== window || !ev.data || ev.data.__ytdl_to_hook !== true) return;
-    const { cmd, reqId, height, format, end } = ev.data;
+    const { cmd, reqId, height, format, start, end } = ev.data;
     const reply = (payload, transfer) => window.postMessage(
       Object.assign({ __ytdl_from_hook: true, reqId }, payload), '*', transfer || []);
     try {
@@ -422,6 +429,13 @@
           duration: (video() && video().duration) || 0,
           heights: availableHeights(),
         });
+      } else if (cmd === 'play') {
+        // background worker tabs: YouTube leaves the player "cued" until playback
+        // starts, so duration stays unknown — kick it off (the tab is muted anyway)
+        const p = player();
+        try { p && p.playVideo && p.playVideo(); } catch (e) {}
+        try { const v = video(); if (v) v.muted = true; } catch (e) {}
+        reply({ ok: true });
       } else if (cmd === 'download') {
         const isMp3 = format === 'mp3';
         // mp3 only needs audio → capture at a low but still-adaptive video quality
@@ -429,7 +443,7 @@
         const targetQ = isMp3 ? 'medium' : (Q[height] || 'hd720');
         const preQ = (targetQ === 'small' || targetQ === 'tiny' || targetQ === 'medium') ? 'tiny' : 'medium';
         await playthrough(
-          { targetQ, preQ, end, needVideo: !isMp3 },
+          { targetQ, preQ, start, end, needVideo: !isMp3 },
           (pct) => reply({ progress: pct, phase: 'buffering' }));
 
         const aud = assemble('audio');
