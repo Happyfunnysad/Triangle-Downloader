@@ -98,4 +98,5 @@ This project is licensed under the **GNU General Public License v3.0** — see t
 ## Authors
 
 - **Black Triangle** — project author and owner.
+- **Happyfunnysad** — co-author and contributor of improvements.
 - **Claude** (Anthropic) — code development.

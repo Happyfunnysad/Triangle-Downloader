@@ -101,4 +101,5 @@ cross-origin isolation).
 ## Авторы
 
 - **Black Triangle** — автор и владелец проекта.
+- **Happyfunnysad** — соавтор и разработчик улучшений.
 - **Claude** (Anthropic) — разработка кода.
