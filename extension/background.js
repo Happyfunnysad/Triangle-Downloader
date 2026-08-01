@@ -210,6 +210,97 @@ function cancelJob(job, silent) {
   setTimeout(() => { delete jobs[job.id]; }, 30000);
 }
 
+// ---- Taildrop --------------------------------------------------------------
+// Taildrop is only reachable through tailscaled (a unix socket), so the browser
+// cannot send files itself. The file is saved locally as usual and its PATH is
+// handed to a small native-messaging helper that runs `tailscale file cp`.
+const TD_HOST = 'com.triangle.taildrop';
+
+function nativeSend(payload) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const timer = setTimeout(() => {
+      if (!done) { done = true; reject(new Error('помощник Taildrop не ответил')); }
+    }, payload && payload.cmd === 'send' ? 60 * 60 * 1000 : 30000);
+    try {
+      chrome.runtime.sendNativeMessage(TD_HOST, payload, (resp) => {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        const err = chrome.runtime.lastError;
+        if (err) {
+          reject(new Error(/not found|Specified native/i.test(err.message || '')
+            ? 'помощник Taildrop не установлен — запустите native/install.sh'
+            : err.message));
+          return;
+        }
+        resolve(resp || { ok: false, error: 'пустой ответ помощника' });
+      });
+    } catch (e) {
+      done = true; clearTimeout(timer);
+      reject(e);
+    }
+  });
+}
+
+// Wait for chrome.downloads to finish writing the file, then read its real path.
+function waitForDownload(id) {
+  return new Promise((resolve) => {
+    const check = async () => {
+      try {
+        const [item] = await chrome.downloads.search({ id });
+        if (!item) return resolve(null);
+        if (item.state === 'complete') return resolve(item.filename || null);
+        if (item.state === 'interrupted') return resolve(null);
+      } catch (e) { return resolve(null); }
+      return null;
+    };
+    const onChanged = async (delta) => {
+      if (delta.id !== id || !delta.state) return;
+      if (delta.state.current === 'complete' || delta.state.current === 'interrupted') {
+        chrome.downloads.onChanged.removeListener(onChanged);
+        resolve(await check());
+      }
+    };
+    chrome.downloads.onChanged.addListener(onChanged);
+    check().then((r) => { if (r) { chrome.downloads.onChanged.removeListener(onChanged); resolve(r); } });
+    setTimeout(() => { chrome.downloads.onChanged.removeListener(onChanged); resolve(null); }, 10 * 60 * 1000);
+  });
+}
+
+// Helper-based delivery (Taildrop / SMB / FTP) — the ones that need a local
+// process. S3 and WebDAV never come through here: the offscreen document uploads
+// those directly from its Blob. If no destination is configured this is a no-op,
+// so a missing helper cannot break the ordinary download flow.
+async function taildropAfterDownload(id) {
+  let cfg = {};
+  try { cfg = await chrome.storage.local.get(['dest', 'tdTarget', 'smbDir', 'ftpcfg']); } catch (e) {}
+  const type = cfg.dest && cfg.dest.type;
+  if (type !== 'taildrop' && type !== 'smb' && type !== 'ftp') return;
+
+  const path = await waitForDownload(id);
+  if (!path) { notify('Файл не сохранился — доставка отменена'); return; }
+
+  try {
+    if (type === 'taildrop' && cfg.tdTarget) {
+      notify('Taildrop: отправляю на ' + cfg.tdTarget + '…');
+      const r = await nativeSend({ cmd: 'send', path, target: cfg.tdTarget });
+      notify(r && r.ok ? 'Taildrop: отправлено на ' + cfg.tdTarget
+                       : 'Taildrop: ошибка — ' + ((r && r.error) || 'неизвестно'));
+    } else if (type === 'smb' && cfg.smbDir) {
+      const r = await nativeSend({ cmd: 'smb-save', path, dir: cfg.smbDir });
+      notify(r && r.ok ? 'SMB: скопировано в ' + cfg.smbDir
+                       : 'SMB: ошибка — ' + ((r && r.error) || 'неизвестно'));
+    } else if (type === 'ftp' && cfg.ftpcfg && cfg.ftpcfg.host) {
+      notify('FTP: выгружаю на ' + cfg.ftpcfg.host + '…');
+      const r = await nativeSend(Object.assign({ cmd: 'ftp-put', path }, cfg.ftpcfg));
+      notify(r && r.ok ? 'FTP: выгружено на ' + cfg.ftpcfg.host
+                       : 'FTP: ошибка — ' + ((r && r.error) || 'неизвестно'));
+    }
+  } catch (e) {
+    notify(type.toUpperCase() + ': ошибка — ' + String((e && e.message) || e));
+  }
+}
+
 function notify(message) {
   try {
     const p = chrome.notifications.create({
@@ -281,8 +372,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.t === 'ytdl-save') {
     chrome.downloads.download({ url: msg.url, filename: msg.filename, saveAs: false })
-      .then((id) => sendResponse({ ok: true, id }))
+      .then((id) => { taildropAfterDownload(id); sendResponse({ ok: true, id }); })
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
+    return true;
+  }
+
+  if (msg.t === 'ytdl-td-devices') {
+    nativeSend({ cmd: 'devices' })
+      .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true;
+  }
+
+  if (msg.t === 'ytdl-note') {
+    notify(String(msg.message || ''));
+    return;
+  }
+
+  if (msg.t === 'ytdl-smb') {
+    // {cmd: 'smb-mounted' | 'smb-discover' | 'smb-shares', ...}
+    nativeSend(Object.assign({ cmd: msg.cmd }, msg.args || {}))
+      .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true;
+  }
+
+  if (msg.t === 'ytdl-td-ping') {
+    nativeSend({ cmd: 'ping' })
+      .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
     return true;
   }
 

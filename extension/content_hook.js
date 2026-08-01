@@ -423,10 +423,16 @@
     try {
       if (cmd === 'info') {
         const p = player();
+        // player.getDuration() knows the duration even while the player is only
+        // "cued" (before playback starts) — video.duration stays 0 until then,
+        // and waiting on it kept the menu invisible for many seconds.
+        let dur = 0;
+        try { dur = (p && p.getDuration && p.getDuration()) || 0; } catch (e) {}
+        if (!dur) dur = (video() && video().duration) || 0;
         reply({
           ok: true, videoId: vidId(),
           title: (p && p.getVideoData && p.getVideoData().title) || document.title.replace(/ - YouTube$/, ''),
-          duration: (video() && video().duration) || 0,
+          duration: dur,
           heights: availableHeights(),
         });
       } else if (cmd === 'play') {

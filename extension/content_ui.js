@@ -148,18 +148,63 @@
     return row;
   }
 
+  // After the extension is reloaded, content scripts already running in open tabs
+  // are orphaned: every chrome.* call throws "Extension context invalidated".
+  // Without this check onClick would reject before the menu is ever inserted and
+  // the button would look dead.
+  function contextAlive() {
+    try { return !!(chrome.runtime && chrome.runtime.id); } catch (e) { return false; }
+  }
+
+  let opening = false; // openMenu awaits the player: ignore re-clicks meanwhile,
+                       // otherwise each click builds another orphaned menu
   async function onClick(e) {
     e.stopPropagation();
+    if (opening) return;
     if (menuEl) { closeMenu(); return; }
+    const btn = document.getElementById(BTN_ID);
+    opening = true;
+    if (btn) btn.style.opacity = '.4'; // instant feedback while the player answers
+    try {
+      await openMenu();
+    } catch (err) {
+      console.error('[Triangle] не удалось открыть меню:', err);
+      if (menuEl) { menuEl.remove(); menuEl = null; }
+      const t = toast();
+      t.set(contextAlive() ? 'Ошибка меню: ' + ((err && err.message) || err)
+                           : 'Расширение обновилось — обновите страницу (F5)', 1);
+      t.hide(6000);
+    } finally {
+      opening = false;
+      if (btn) btn.style.opacity = '';
+    }
+  }
 
-    const info = await callHook('info');
+  async function openMenu() {
+    if (!contextAlive()) throw new Error('расширение перезагружено');
+
+    // The player reports duration 0 until it is ready; without it the fragment
+    // rail and the size estimate are meaningless, so give it a few tries.
+    let info = null;
+    for (let i = 0; i < 12; i++) {
+      info = await Promise.race([
+        callHook('info'),
+        new Promise((r) => setTimeout(() => r(null), 2500)), // hook missing → don't hang
+      ]);
+      if (info && info.duration > 0) break;
+      await sleep(400);
+    }
+    if (!info) throw new Error('плеер не отвечает, обновите страницу');
+
     const duration = Math.floor(info.duration || 0);
     const heights = (info.heights || []).filter((h) => h === 1080 || h === 720);
     if (!heights.includes(1080)) heights.unshift(1080);
     if (!heights.includes(720)) heights.push(720);
     const uniq = [...new Set(heights)].sort((a, b) => b - a);
 
-    const store = await chrome.storage.local.get(['transcode', 'sbCut', 'parTabs', 'parChunk']);
+    let store = {};
+    try { store = await chrome.storage.local.get(['transcode', 'sbCut', 'parTabs', 'parChunk']); }
+    catch (e) { /* fall back to defaults rather than losing the menu */ }
     const cfg = {
       transcode: !!store.transcode,
       sbCut: store.sbCut !== false,
@@ -254,6 +299,72 @@
     });
     main.appendChild(seg);
 
+    // destination — first-class, right above the action, not buried in settings.
+    // Pills are built from CONFIGURED targets: S3/WebDAV work with no helper at
+    // all (uploaded straight from the extension), Taildrop/SMB/FTP appear once
+    // set up in settings. With nothing configured there is just «Локально» —
+    // exactly the behaviour the extension had before any of this existed.
+    let dest = 'local';           // 'local' | 's3' | 'webdav' | 'ftp' | 'smb' | 'taildrop'
+    let targets = {};             // filled from storage
+    const destWrap = el('div', 'ytdl-dest');
+    destWrap.appendChild(el('div', 'ytdl-dest-cap', 'Куда'));
+    const destRow = el('div', 'ytdl-pills');
+    destWrap.appendChild(destRow);
+    const destPath = el('div', 'ytdl-dest-path');
+    destWrap.appendChild(destPath);
+    main.appendChild(destWrap);
+
+    function pill(kind, badge, label) {
+      const b = el('button', 'ytdl-pill' + (dest === kind ? ' sel' : ''));
+      b.appendChild(el('i', 'ytdl-pill-b', badge));
+      b.appendChild(el('span', null, label));
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        dest = kind;
+        chrome.storage.local.set({ dest: { type: kind } }).catch(() => {});
+        renderDest();
+        render();
+      });
+      return b;
+    }
+
+    function renderDest() {
+      while (destRow.firstChild) destRow.removeChild(destRow.firstChild);
+      destRow.appendChild(pill('local', '↓', 'Локально'));
+      const t = targets;
+      if (t.s3cfg && t.s3cfg.bucket) destRow.appendChild(pill('s3', 'S3', t.s3cfg.bucket));
+      if (t.wdcfg && t.wdcfg.url) destRow.appendChild(pill('webdav', 'DAV', (() => { try { return new URL(t.wdcfg.url).host; } catch (e) { return 'WebDAV'; } })()));
+      if (t.ftpcfg && t.ftpcfg.host) destRow.appendChild(pill('ftp', 'FTP', t.ftpcfg.host));
+      if (t.smbDir) destRow.appendChild(pill('smb', 'NAS', t.smbDir.split('/').pop() || 'шара'));
+      if (t.tdTarget) destRow.appendChild(pill('taildrop', 'TS', t.tdTarget));
+      const add = el('button', 'ytdl-pill ytdl-pill-add', '+');
+      add.title = 'настроить получателей';
+      add.addEventListener('click', (ev) => { ev.stopPropagation(); showPane('settings'); });
+      destRow.appendChild(add);
+      destPath.textContent =
+        dest === 's3' ? 's3://' + t.s3cfg.bucket + '/' + ((t.s3cfg.prefix || '').replace(/^\/+|\/+$/g, '')) + '/'
+        : dest === 'webdav' ? t.wdcfg.url
+        : dest === 'ftp' ? 'ftp://' + t.ftpcfg.host + '/' + (t.ftpcfg.dir || '')
+        : dest === 'smb' ? 'smb://' + String(t.smbDir).replace(/^\/Volumes\//, '')
+        : dest === 'taildrop' ? 'taildrop → ' + t.tdTarget
+        : 'папка загрузок браузера';
+    }
+
+    async function reloadDest() {
+      let s = {};
+      try { s = await chrome.storage.local.get(['dest', 's3cfg', 'wdcfg', 'ftpcfg', 'smbDir', 'tdTarget']); } catch (e) {}
+      targets = s;
+      const valid = {
+        local: true,
+        s3: s.s3cfg && s.s3cfg.bucket, webdav: s.wdcfg && s.wdcfg.url,
+        ftp: s.ftpcfg && s.ftpcfg.host, smb: s.smbDir, taildrop: s.tdTarget,
+      };
+      dest = (s.dest && valid[s.dest.type]) ? s.dest.type : 'local';
+      renderDest();
+      render();
+    }
+    reloadDest();
+
     // primary action
     const cta = el('button', 'ytdl-cta');
     const ctaMark = el('span'); ctaMark.style.width = '15px'; ctaMark.style.height = '15px';
@@ -307,6 +418,169 @@
       [{ key: 'fast', label: 'Быстро' }, { key: 'h264', label: 'H.264' }],
       cfg.transcode ? 'h264' : 'fast',
       (k) => { cfg.transcode = k === 'h264'; chrome.storage.local.set({ transcode: cfg.transcode }); renderChips(); }));
+    // ---- delivery targets ---------------------------------------------------
+    // Two classes, deliberately separated:
+    //   * S3 / WebDAV — uploaded straight from the extension, no helper, always on;
+    //   * Taildrop / SMB / FTP — need the native helper; without it these rows show
+    //     a quiet "нужен помощник" hint and NOTHING else changes. No banners, no
+    //     errors on open: the base extension must behave exactly as before.
+    settings.appendChild(el('div', 'ytdl-sec', 'Получатели'));
+
+    function fieldGrid(fields, saveKey) {
+      const grid = el('div', 'ytdl-fgrid');
+      const inputs = {};
+      for (const f of fields) {
+        const i = document.createElement('input');
+        i.className = 'ytdl-f';
+        i.placeholder = f.ph;
+        i.value = f.val || '';
+        i.spellcheck = false;
+        if (f.secret) i.type = 'password';
+        if (f.wide) i.classList.add('wide');
+        i.addEventListener('click', (ev) => ev.stopPropagation());
+        i.addEventListener('change', async () => {
+          const out = {};
+          for (const k of Object.keys(inputs)) out[k] = inputs[k].value.trim();
+          try { await chrome.storage.local.set({ [saveKey]: out }); } catch (e) {}
+          reloadDest();
+        });
+        inputs[f.k] = i;
+        grid.appendChild(i);
+      }
+      return grid;
+    }
+
+    const s3 = targets.s3cfg || {};
+    settings.appendChild(el('div', 'ytdl-hint', 'S3 — выгрузка напрямую из расширения, помощник не нужен'));
+    settings.appendChild(fieldGrid([
+      { k: 'endpoint', ph: 'endpoint (https://s3.amazonaws.com)', val: s3.endpoint, wide: true },
+      { k: 'bucket', ph: 'bucket', val: s3.bucket },
+      { k: 'region', ph: 'region (us-east-1)', val: s3.region },
+      { k: 'prefix', ph: 'папка (youtube/2026)', val: s3.prefix, wide: true },
+      { k: 'key', ph: 'access key', val: s3.key },
+      { k: 'secret', ph: 'secret key', val: s3.secret, secret: true },
+    ], 's3cfg'));
+
+    const wd = targets.wdcfg || {};
+    settings.appendChild(el('div', 'ytdl-hint', 'WebDAV — тоже напрямую (Synology/Nextcloud/QNAP)'));
+    settings.appendChild(fieldGrid([
+      { k: 'url', ph: 'https://nas.local:5006/video', val: wd.url, wide: true },
+      { k: 'user', ph: 'логин', val: wd.user },
+      { k: 'pass', ph: 'пароль', val: wd.pass, secret: true },
+    ], 'wdcfg'));
+
+    // helper presence decides how the next three rows behave
+    let haveHelper = false;
+    const HELP_HINT = 'нужен помощник: native/install.sh <id расширения>';
+
+    const ftp = targets.ftpcfg || {};
+    const ftpHint = el('div', 'ytdl-hint', 'FTP — через помощника');
+    settings.appendChild(ftpHint);
+    settings.appendChild(fieldGrid([
+      { k: 'host', ph: 'ftp.server.local', val: ftp.host, wide: true },
+      { k: 'port', ph: '21', val: ftp.port },
+      { k: 'dir', ph: 'папка', val: ftp.dir },
+      { k: 'user', ph: 'логин', val: ftp.user },
+      { k: 'pass', ph: 'пароль', val: ftp.pass, secret: true },
+    ], 'ftpcfg'));
+
+    const tdRow = el('div', 'ytdl-row');
+    const tdTop = el('div', 'ytdl-row-top');
+    tdTop.appendChild(el('span', null, 'Taildrop'));
+    const tdPick = el('select', 'ytdl-select');
+    tdTop.appendChild(tdPick);
+    tdRow.appendChild(tdTop);
+    const tdHint = el('div', 'ytdl-hint', 'устройство Tailscale');
+    tdRow.appendChild(tdHint);
+    settings.appendChild(tdRow);
+
+    const smbRow = el('div', 'ytdl-row');
+    const smbTop = el('div', 'ytdl-row-top');
+    smbTop.appendChild(el('span', null, 'Сетевая папка'));
+    const smbPick = el('select', 'ytdl-select');
+    smbTop.appendChild(smbPick);
+    const smbScan = el('button', 'ytdl-mini', 'искать');
+    smbTop.appendChild(smbScan);
+    smbRow.appendChild(smbTop);
+    const smbHint = el('div', 'ytdl-hint', 'смонтированная SMB-шара');
+    smbRow.appendChild(smbHint);
+    settings.appendChild(smbRow);
+
+    function emptyPick(pick, label) {
+      while (pick.firstChild) pick.removeChild(pick.firstChild);
+      const o = el('option', null, label);
+      o.value = '';
+      pick.appendChild(o);
+    }
+
+    async function loadHelperRows() {
+      emptyPick(tdPick, 'не отправлять');
+      emptyPick(smbPick, 'не копировать');
+      // one quiet probe decides everything — absence is a state, not an error
+      let ping = null;
+      try { ping = await chrome.runtime.sendMessage({ t: 'ytdl-td-ping' }); } catch (e) {}
+      haveHelper = !!(ping && (ping.ok || ping.pong || ping.tailscale !== undefined));
+      if (!haveHelper) {
+        tdPick.disabled = smbPick.disabled = smbScan.disabled = true;
+        tdHint.textContent = smbHint.textContent = HELP_HINT;
+        ftpHint.textContent = 'FTP — ' + HELP_HINT;
+        return;
+      }
+      tdPick.disabled = smbPick.disabled = smbScan.disabled = false;
+
+      const [devs, mounted, st] = await Promise.all([
+        chrome.runtime.sendMessage({ t: 'ytdl-td-devices' }).catch(() => null),
+        chrome.runtime.sendMessage({ t: 'ytdl-smb', cmd: 'smb-mounted' }).catch(() => null),
+        chrome.storage.local.get(['tdTarget', 'smbDir']).catch(() => ({})),
+      ]);
+      if (devs && devs.ok && devs.devices.length) {
+        for (const d of devs.devices) {
+          const o = el('option', null, d.name + (d.online ? '' : ' (офлайн)'));
+          o.value = d.host;
+          tdPick.appendChild(o);
+        }
+        if (st.tdTarget) tdPick.value = st.tdTarget;
+        tdHint.textContent = 'устройство Tailscale';
+      } else {
+        tdHint.textContent = (devs && devs.error) || 'в вашей сети нет других устройств';
+      }
+      if (mounted && mounted.ok) {
+        for (const m of mounted.mounted) {
+          const o = el('option', null, m.name + (m.writable ? '' : ' (только чтение)'));
+          o.value = m.path;
+          smbPick.appendChild(o);
+        }
+        if (st.smbDir) smbPick.value = st.smbDir;
+        smbHint.textContent = mounted.mounted.length
+          ? 'смонтированная SMB-шара'
+          : 'шар нет — «искать» покажет серверы, монтировать в Finder (⌘K)';
+      }
+    }
+    loadHelperRows();
+
+    [tdPick, smbPick].forEach((p) => p.addEventListener('click', (ev) => ev.stopPropagation()));
+    tdPick.addEventListener('change', async () => {
+      await chrome.storage.local.set({ tdTarget: tdPick.value || null }).catch(() => {});
+      reloadDest();
+    });
+    smbPick.addEventListener('change', async () => {
+      await chrome.storage.local.set({ smbDir: smbPick.value || null }).catch(() => {});
+      reloadDest();
+    });
+    smbScan.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      smbScan.disabled = true;
+      smbHint.textContent = 'ищу серверы в сети…';
+      let r = null;
+      try { r = await chrome.runtime.sendMessage({ t: 'ytdl-smb', cmd: 'smb-discover' }); } catch (e) {}
+      smbScan.disabled = false;
+      if (!r || !r.ok) { smbHint.textContent = (r && r.error) || 'поиск не удался'; return; }
+      smbHint.textContent = r.servers.length
+        ? 'найдено: ' + r.servers.map((s) => s.name).join(', ') + ' — монтируйте в Finder (⌘K)'
+        : 'серверы SMB не найдены';
+      loadHelperRows();
+    });
+
     const back = el('button', 'ytdl-back', '‹ назад к загрузке');
     back.addEventListener('click', (ev) => { ev.stopPropagation(); showPane('main'); });
     settings.appendChild(back);
@@ -342,9 +616,12 @@
       lenTxt.textContent = '· ' + fmtShort(end - start);
       const whole = fmt.kind === 'txt';
       strip.style.opacity = whole ? '.45' : '';
+      const size = fmtSize(rateFor(fmt.kind, fmt.height) * (end - start));
+      // the button states the whole action: local save, or save + upload
       ctaTxt.textContent = whole
-        ? 'Скачать субтитры'
-        : 'Скачать ' + fmt.label + ' · ' + fmtSize(rateFor(fmt.kind, fmt.height) * (end - start));
+        ? (dest === 'local' ? 'Скачать субтитры' : 'Скачать и выгрузить субтитры')
+        : (dest === 'local' ? 'Скачать ' + fmt.label + ' · ' + size
+                            : 'Скачать и выгрузить · ' + size);
       renderChips();
     }
 

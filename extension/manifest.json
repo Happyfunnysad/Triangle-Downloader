@@ -3,8 +3,8 @@
   "name": "Triangle Downloader",
   "version": "1.5.0",
   "description": "Скачивает открытое видео YouTube (720p/1080p mp4, mp3, выбор фрагмента), перехватывая поток самого плеера. Вырезает рекламные вставки по данным SponsorBlock, ускоряет длинные видео параллельными вкладками. Без yt-dlp и внешних сервисов.",
-  "permissions": ["downloads", "offscreen", "storage", "tabs", "notifications"],
-  "host_permissions": ["*://www.youtube.com/*", "https://sponsor.ajay.app/*"],
+  "permissions": ["downloads", "offscreen", "storage", "tabs", "notifications", "nativeMessaging"],
+  "host_permissions": ["*://www.youtube.com/*", "https://sponsor.ajay.app/*", "https://*/*", "http://*/*"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
     {

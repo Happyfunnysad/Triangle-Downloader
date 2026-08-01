@@ -150,6 +150,59 @@
 .ytdl-opts button:hover { color: #fff; }
 .ytdl-opts button.sel { background: rgba(255,78,69,.22); color: #ff8f89; font-weight: 600; }
 .ytdl-hint { font-size: 11px; color: #6f7378; line-height: 1.35; }
+.ytdl-select {
+  margin-left: auto;
+  max-width: 60%;
+  background: rgba(255,255,255,.06);
+  border: 0; border-radius: 8px;
+  color: #e6e6e6; font: inherit; font-size: 12px;
+  padding: 4px 6px; cursor: pointer;
+}
+.ytdl-select:disabled { color: #6f7378; cursor: default; }
+.ytdl-select option { background: #1c1c1c; color: #e6e6e6; }
+.ytdl-mini {
+  background: rgba(255,255,255,.06); border: 0; border-radius: 8px;
+  color: #e6e6e6; font: inherit; font-size: 11.5px;
+  padding: 4px 8px; cursor: pointer; white-space: nowrap;
+}
+.ytdl-mini:hover { background: rgba(255,255,255,.14); }
+.ytdl-mini:disabled { color: #6f7378; cursor: default; }
+.ytdl-sec {
+  font-size: 11px; color: #6f7378; text-transform: uppercase; letter-spacing: .06em;
+  margin-top: 2px;
+}
+.ytdl-fgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.ytdl-f {
+  box-sizing: border-box; width: 100%;
+  background: rgba(255,255,255,.06); border: 1px solid transparent; border-radius: 8px;
+  color: #e6e6e6; font: inherit; font-size: 12px;
+  padding: 6px 8px; outline: none;
+}
+.ytdl-f.wide { grid-column: 1 / -1; }
+.ytdl-f:focus { border-color: rgba(255,78,69,.6); background: rgba(255,255,255,.09); }
+.ytdl-f::placeholder { color: #6f7378; }
+
+/* destination pills — first-class, on the main pane above the action */
+.ytdl-dest { display: flex; flex-direction: column; gap: 7px; }
+.ytdl-dest-cap { font-size: 11px; color: #6f7378; }
+.ytdl-pills { display: flex; flex-wrap: wrap; gap: 7px; }
+.ytdl-pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  background: rgba(255,255,255,.07); border: 0; border-radius: 999px;
+  color: #e6e6e6; font: inherit; font-size: 12.5px;
+  padding: 6px 13px 6px 7px; cursor: pointer; white-space: nowrap;
+}
+.ytdl-pill:hover { background: rgba(255,255,255,.13); }
+.ytdl-pill-b {
+  display: grid; place-items: center; min-width: 20px; height: 20px;
+  padding: 0 5px; border-radius: 999px;
+  background: rgba(255,255,255,.13);
+  font-size: 9.5px; font-style: normal; font-weight: 700; letter-spacing: .03em;
+}
+.ytdl-pill.sel { background: rgba(255,78,69,.22); color: #ff8079; }
+.ytdl-pill.sel .ytdl-pill-b { background: #ff4e45; color: #fff; }
+.ytdl-pill-add { padding: 6px 12px; color: #9aa0a6; font-size: 14px; line-height: 1; }
+.ytdl-dest-path { font-size: 11px; color: #6f7378; font-variant-numeric: tabular-nums; }
 .ytdl-back {
   align-self: flex-start;
   background: transparent; border: 0; padding: 0;

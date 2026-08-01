@@ -260,7 +260,99 @@ async function saveBlob(data, baseName, chosen) {
   const res = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename });
   setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
   if (!res || !res.ok) throw new Error((res && res.error) || 'save failed');
+  // Network uploads happen HERE, not in the background: the finished file already
+  // lives in this document as a Blob, so S3/WebDAV need no helper and no disk read.
+  maybeUpload(blob, filename); // fire-and-forget; status arrives via notifications
   return filename;
+}
+
+// ---- direct uploads (no native helper required) ----------------------------
+function note(message) {
+  try { chrome.runtime.sendMessage({ t: 'ytdl-note', message }); } catch (e) {}
+}
+
+async function hmac(keyBytes, str) {
+  const k = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(str)));
+}
+async function sha256hexStr(s) {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+const hex = (u8) => [...u8].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+// Minimal AWS Signature V4 for a single PUT. UNSIGNED-PAYLOAD keeps us from
+// hashing a multi-GB body in JS; S3 and MinIO both accept it over HTTPS.
+async function s3Put(blob, filename, cfg) {
+  const endpoint = new URL(cfg.endpoint);
+  const region = cfg.region || 'us-east-1';
+  const enc = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  const keyPath = ((cfg.prefix || '').replace(/^\/+|\/+$/g, '') + '/' + filename).replace(/^\/+/, '');
+  const uri = '/' + enc(cfg.bucket) + '/' + keyPath.split('/').map(enc).join('/');
+
+  const now = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+  const day = now.slice(0, 8);
+  const host = endpoint.host;
+
+  const headers = {
+    host,
+    'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+    'x-amz-date': now,
+  };
+  const signedList = Object.keys(headers).sort();
+  const canonical = ['PUT', uri, '',
+    ...signedList.map((h) => h + ':' + headers[h]), '',
+    signedList.join(';'), 'UNSIGNED-PAYLOAD'].join('\n');
+  const scope = day + '/' + region + '/s3/aws4_request';
+  const toSign = ['AWS4-HMAC-SHA256', now, scope, await sha256hexStr(canonical)].join('\n');
+
+  let k = await hmac(new TextEncoder().encode('AWS4' + cfg.secret), day);
+  k = await hmac(k, region);
+  k = await hmac(k, 's3');
+  k = await hmac(k, 'aws4_request');
+  const sig = hex(await hmac(k, toSign));
+
+  const auth = 'AWS4-HMAC-SHA256 Credential=' + cfg.key + '/' + scope +
+    ', SignedHeaders=' + signedList.join(';') + ', Signature=' + sig;
+
+  const r = await fetch(endpoint.origin + uri, {
+    method: 'PUT',
+    headers: {
+      Authorization: auth,
+      'x-amz-date': now,
+      'x-amz-content-sha256': 'UNSIGNED-PAYLOAD',
+      'Content-Type': blob.type || 'application/octet-stream',
+    },
+    body: blob,
+  });
+  if (!r.ok) throw new Error('S3 HTTP ' + r.status + ' ' + (await r.text().catch(() => '')).slice(0, 120));
+}
+
+async function webdavPut(blob, filename, cfg) {
+  const url = String(cfg.url || '').replace(/\/+$/, '') + '/' + encodeURIComponent(filename);
+  const headers = {};
+  if (cfg.user) headers.Authorization = 'Basic ' + btoa(cfg.user + ':' + (cfg.pass || ''));
+  const r = await fetch(url, { method: 'PUT', headers, body: blob });
+  if (!r.ok && r.status !== 201 && r.status !== 204) throw new Error('WebDAV HTTP ' + r.status);
+}
+
+async function maybeUpload(blob, filename) {
+  let s = {};
+  try { s = await chrome.storage.local.get(['dest', 's3cfg', 'wdcfg']); } catch (e) { return; }
+  const type = s.dest && s.dest.type;
+  try {
+    if (type === 's3' && s.s3cfg && s.s3cfg.bucket) {
+      note('S3: выгружаю ' + filename + '…');
+      await s3Put(blob, filename, s.s3cfg);
+      note('S3: выгружено — ' + filename);
+    } else if (type === 'webdav' && s.wdcfg && s.wdcfg.url) {
+      note('WebDAV: выгружаю ' + filename + '…');
+      await webdavPut(blob, filename, s.wdcfg);
+      note('WebDAV: выгружено — ' + filename);
+    }
+  } catch (e) {
+    note('Выгрузка: ошибка — ' + String((e && e.message) || e));
+  }
 }
 
 // ---- parallel merge --------------------------------------------------------
