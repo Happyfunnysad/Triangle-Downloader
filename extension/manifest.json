@@ -2,10 +2,13 @@
   "manifest_version": 3,
   "name": "Triangle Downloader",
   "version": "1.5.0",
-  "description": "Скачивает открытое видео YouTube (720p/1080p mp4, mp3, выбор фрагмента), перехватывая поток самого плеера. Вырезает рекламные вставки по данным SponsorBlock, ускоряет длинные видео параллельными вкладками. Без yt-dlp и внешних сервисов.",
-  "permissions": ["downloads", "offscreen", "storage", "tabs", "notifications", "nativeMessaging"],
+  "description": "Скачивает видео, аудио и субтитры YouTube, вырезает SponsorBlock и добавляет VOT-перевод. Без yt-dlp.",
+  "permissions": ["downloads", "offscreen", "storage", "tabs", "notifications", "nativeMessaging", "declarativeNetRequest"],
   "host_permissions": ["*://www.youtube.com/*", "https://sponsor.ajay.app/*", "https://*/*", "http://*/*"],
   "background": { "service_worker": "background.js" },
+  "declarative_net_request": {
+    "rule_resources": [{ "id": "vot_ua", "enabled": true, "path": "dnr_vot.json" }]
+  },
   "content_scripts": [
     {
       "matches": ["*://www.youtube.com/*"],
@@ -19,6 +22,13 @@
       "js": ["content_ui.js"],
       "css": ["content_ui.css"],
       "run_at": "document_idle",
+      "world": "ISOLATED",
+      "all_frames": false
+    },
+    {
+      "matches": ["https://rust-server-531j.onrender.com/*"],
+      "js": ["vot_auth.js"],
+      "run_at": "document_end",
       "world": "ISOLATED",
       "all_frames": false
     }

@@ -181,6 +181,12 @@
 .ytdl-f.wide { grid-column: 1 / -1; }
 .ytdl-f:focus { border-color: rgba(255,78,69,.6); background: rgba(255,255,255,.09); }
 .ytdl-f::placeholder { color: #6f7378; }
+.ytdl-f.bad { border-color: rgba(255,120,90,.75); background: rgba(255,78,69,.08); }
+.ytdl-err {
+  font-size: 11.5px; line-height: 1.35; color: #ff9d8f;
+  margin-top: 6px;
+}
+.ytdl-err:empty { display: none; }
 
 /* destination pills — first-class, on the main pane above the action */
 .ytdl-dest { display: flex; flex-direction: column; gap: 7px; }
@@ -295,3 +301,10 @@
   background: #ff4e45;
   transition: width .2s;
 }
+#ytdl-toast .ytdl-toast-copy {
+  align-self: flex-start;
+  background: rgba(255,255,255,.08); border: 0; border-radius: 8px;
+  color: #e6e6e6; font: inherit; font-size: 11.5px;
+  padding: 5px 9px; cursor: pointer;
+}
+#ytdl-toast .ytdl-toast-copy:hover { background: rgba(255,255,255,.16); }

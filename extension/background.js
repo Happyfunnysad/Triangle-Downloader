@@ -210,6 +210,27 @@ function cancelJob(job, silent) {
   setTimeout(() => { delete jobs[job.id]; }, 30000);
 }
 
+// ---- журнал запусков -------------------------------------------------------
+// Доставка и выгрузка происходят уже после того, как вкладка закрыла запись
+// текущего запуска, поэтому их шаги дописывает сюда сам service worker —
+// иначе в журнале не оставалось ни следа от «ничего не отправилось».
+const RUNLOG_KEY = 'runLogs';
+let runlogWriting = Promise.resolve(); // записи строго по очереди
+
+function runlogAppend(msg) {
+  runlogWriting = runlogWriting.then(async () => {
+    // вкладка могла ещё не дописать финальные шаги («файл сохранён», итог) —
+    // подождём, чтобы не прочитать список до её записи и не затереть их
+    await new Promise((r) => setTimeout(r, 2500));
+    const list = (await chrome.storage.local.get(RUNLOG_KEY))[RUNLOG_KEY] || [];
+    const cur = list[list.length - 1];
+    if (!cur || !Array.isArray(cur.steps)) return;
+    cur.steps.push({ t: new Date().toISOString(), msg: String(msg) });
+    await chrome.storage.local.set({ [RUNLOG_KEY]: list });
+  }).catch(() => {});
+  return runlogWriting;
+}
+
 // ---- Taildrop --------------------------------------------------------------
 // Taildrop is only reachable through tailscaled (a unix socket), so the browser
 // cannot send files itself. The file is saved locally as usual and its PATH is
@@ -271,33 +292,45 @@ function waitForDownload(id) {
 // process. S3 and WebDAV never come through here: the offscreen document uploads
 // those directly from its Blob. If no destination is configured this is a no-op,
 // so a missing helper cannot break the ordinary download flow.
-async function taildropAfterDownload(id) {
+async function taildropAfterDownload(id, canLog) {
   let cfg = {};
-  try { cfg = await chrome.storage.local.get(['dest', 'tdTarget', 'smbDir', 'ftpcfg']); } catch (e) {}
+  try { cfg = await chrome.storage.local.get(['dest', 'tdTarget', 'tdLabel', 'smbDir', 'ftpcfg']); } catch (e) {}
   const type = cfg.dest && cfg.dest.type;
-  if (type !== 'taildrop' && type !== 'smb' && type !== 'ftp') return;
+  if (type !== 'taildrop' && type !== 'smb' && type !== 'ftp') {
+    // Самая коварная причина «ничего не отправилось»: получатель настроен,
+    // но в «Куда» осталось «Локально». Оставляем след в журнале запуска.
+    const configured = cfg.tdTarget || cfg.smbDir || (cfg.ftpcfg && cfg.ftpcfg.host);
+    if (canLog && configured && (!type || type === 'local')) {
+      runlogAppend('доставка: не выполнялась — в «Куда» выбрано «Локально», ' +
+        'хотя получатель (Taildrop/SMB/FTP) настроен');
+    }
+    return;
+  }
+
+  const log = (m) => { notify(m); if (canLog) runlogAppend('доставка: ' + m); };
 
   const path = await waitForDownload(id);
-  if (!path) { notify('Файл не сохранился — доставка отменена'); return; }
+  if (!path) { log('Файл не сохранился — доставка отменена'); return; }
 
   try {
     if (type === 'taildrop' && cfg.tdTarget) {
-      notify('Taildrop: отправляю на ' + cfg.tdTarget + '…');
+      const who = cfg.tdLabel || cfg.tdTarget;
+      notify('Taildrop: отправляю на ' + who + '…');
       const r = await nativeSend({ cmd: 'send', path, target: cfg.tdTarget });
-      notify(r && r.ok ? 'Taildrop: отправлено на ' + cfg.tdTarget
-                       : 'Taildrop: ошибка — ' + ((r && r.error) || 'неизвестно'));
+      log(r && r.ok ? 'Taildrop: отправлено на ' + who
+                    : 'Taildrop: ошибка — ' + ((r && r.error) || 'неизвестно'));
     } else if (type === 'smb' && cfg.smbDir) {
       const r = await nativeSend({ cmd: 'smb-save', path, dir: cfg.smbDir });
-      notify(r && r.ok ? 'SMB: скопировано в ' + cfg.smbDir
-                       : 'SMB: ошибка — ' + ((r && r.error) || 'неизвестно'));
+      log(r && r.ok ? 'SMB: скопировано в ' + cfg.smbDir
+                    : 'SMB: ошибка — ' + ((r && r.error) || 'неизвестно'));
     } else if (type === 'ftp' && cfg.ftpcfg && cfg.ftpcfg.host) {
       notify('FTP: выгружаю на ' + cfg.ftpcfg.host + '…');
       const r = await nativeSend(Object.assign({ cmd: 'ftp-put', path }, cfg.ftpcfg));
-      notify(r && r.ok ? 'FTP: выгружено на ' + cfg.ftpcfg.host
-                       : 'FTP: ошибка — ' + ((r && r.error) || 'неизвестно'));
+      log(r && r.ok ? 'FTP: выгружено на ' + cfg.ftpcfg.host
+                    : 'FTP: ошибка — ' + ((r && r.error) || 'неизвестно'));
     }
   } catch (e) {
-    notify(type.toUpperCase() + ': ошибка — ' + String((e && e.message) || e));
+    log(type.toUpperCase() + ': ошибка — ' + String((e && e.message) || e));
   }
 }
 
@@ -339,9 +372,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // ffmpeg progress: offscreen → worker → tab (runtime messages don't reach content scripts)
-  if (msg.t === 'ytdl-progress') {
+  // ffmpeg progress / VOT status / вехи журнала: offscreen → worker → tab
+  // (runtime messages don't reach content scripts)
+  if (msg.t === 'ytdl-progress' || msg.t === 'ytdl-vot-status' || msg.t === 'ytdl-run-log') {
     if (progressTab != null) chrome.tabs.sendMessage(progressTab, msg).catch(() => {});
+    return;
+  }
+
+  // шаг в журнал запусков после конца записи со стороны вкладки (выгрузки)
+  if (msg.t === 'ytdl-runlog-append') {
+    runlogAppend(String(msg.msg || ''));
     return;
   }
 
@@ -351,6 +391,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const inner = msg.m || {};
       if (inner.t === 'ytdl-begin') {
         progressTab = senderTab != null ? senderTab : null;
+        await ensureOffscreen();
+      }
+      if (inner.t === 'ytdl-vot-start') {
+        if (senderTab != null) progressTab = senderTab;
         await ensureOffscreen();
       }
       if (inner.t === 'ytdl-par-begin') await ensureOffscreen();
@@ -372,7 +416,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.t === 'ytdl-save') {
     chrome.downloads.download({ url: msg.url, filename: msg.filename, saveAs: false })
-      .then((id) => { taildropAfterDownload(id); sendResponse({ ok: true, id }); })
+      .then((id) => {
+        // служебные файлы (журнал отладки) получателям не доставляются;
+        // fromRun — у сохранения есть запись в журнале, куда писать шаги доставки
+        if (!msg.noDeliver) taildropAfterDownload(id, !!msg.fromRun);
+        sendResponse({ ok: true, id });
+      })
       .catch((e) => sendResponse({ ok: false, error: String(e) }));
     return true;
   }
@@ -380,6 +429,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.t === 'ytdl-td-devices') {
     nativeSend({ cmd: 'devices' })
       .then((r) => sendResponse(r))
+      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    return true;
+  }
+
+  // Вход в Яндекс для живого голоса: отдельное окно, как в оригинальном
+  // юзерскрипте. Токен со страницы подхватит vot_auth.js.
+  if (msg.t === 'ytdl-vot-login') {
+    chrome.windows.create({
+      url: 'https://rust-server-531j.onrender.com/v1/auth/handle',
+      type: 'popup', width: 520, height: 720,
+    })
+      .then(() => sendResponse({ ok: true }))
       .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
     return true;
   }

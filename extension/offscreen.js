@@ -20,6 +20,10 @@ let ffLoading = null;
 const acc = { video: [], audio: [], videoMime: '', audioMime: '', filename: 'video.mp4', sb: [] };
 const par = Object.create(null); // task -> { frags: idx -> {video,audio,mimes,vBytes,aBytes} }
 const ffLog = []; // ring buffer of recent ffmpeg log lines
+// Подпись текущей операции для тоста прогресса: без неё вкладка подписывала
+// любой прогресс «Перекодирование в H.264/AAC», даже когда шли микс перевода
+// или простая склейка без перекодирования.
+let ffPhase = '';
 
 async function getFF() {
   if (ff) return ff;
@@ -27,7 +31,11 @@ async function getFF() {
   ffLoading = (async () => {
     const inst = new FFmpeg();
     inst.on('progress', ({ progress }) => {
-      try { chrome.runtime.sendMessage({ t: 'ytdl-progress', value: Math.max(0, Math.min(1, progress)) }); } catch (e) {}
+      try {
+        chrome.runtime.sendMessage({
+          t: 'ytdl-progress', value: Math.max(0, Math.min(1, progress)), phase: ffPhase,
+        });
+      } catch (e) {}
     });
     inst.on('log', ({ message }) => {
       ffLog.push(message);
@@ -65,6 +73,7 @@ async function rm(inst, name) { try { await inst.deleteFile(name); } catch (e) {
 // `ffmpeg -i file` exits with an error but prints "Duration: ..., start: X" first.
 async function probeStart(inst, name) {
   ffLog.length = 0;
+  ffPhase = 'Анализ дорожек';
   try { await inst.exec(['-hide_banner', '-i', name]); } catch (e) {}
   const m = ffLog.join('\n').match(/start:\s*(-?[\d.]+)/);
   return m ? Math.max(0, parseFloat(m[1])) : 0;
@@ -103,11 +112,16 @@ function dropExpr(relCuts) {
 
 // ---- single mode -----------------------------------------------------------
 // Fast mode with SponsorBlock: stream-copy each kept span, then concat.
-async function copyCutConcat(inst, vName, aName, keep, sV, sA) {
+// vot: {third, lang} — при активном VOT только mp4 (AAC-микс/вторая дорожка
+// несовместимы с webm); third — файл перевода третьим входом (режим «дорожка»).
+async function copyCutConcat(inst, vName, aName, keep, sV, sA, vot) {
   const variants = [
     { ext: 'mp4', type: 'video/mp4', extra: ['-strict', '-2'], concatExtra: ['-movflags', '+faststart'] },
     { ext: 'webm', type: 'video/webm', extra: [], concatExtra: [] },
   ];
+  if (vot) variants.length = 1;
+  const third = (vot && vot.third) || null;
+  ffPhase = 'Вырезка вставок и склейка';
   let lastErr = '';
   for (const v of variants) {
     const made = [];
@@ -121,7 +135,10 @@ async function copyCutConcat(inst, vName, aName, keep, sV, sA) {
       const ret = await inst.exec([
         '-ss', String(Math.max(0, a - sV)), '-i', vName,
         '-ss', String(Math.max(0, a - sA)), '-i', aName,
-        '-map', '0:v:0', '-map', '1:a:0', ...t, '-c', 'copy', ...v.extra, part,
+        ...(third ? ['-ss', String(Math.max(0, a)), '-i', third] : []), // перевод идёт с t=0 видео
+        '-map', '0:v:0', '-map', '1:a:0', ...(third ? ['-map', '2:a:0'] : []),
+        ...t, '-c', 'copy', ...(third ? ['-c:a:1', 'aac', '-b:a:1', '160k'] : []),
+        ...v.extra, part,
       ]);
       if (ret !== 0) {
         lastErr = 'ffmpeg код ' + ret + ' (нарезка ' + v.ext + '): ' + ffLog.slice(-6).join(' | ');
@@ -133,7 +150,9 @@ async function copyCutConcat(inst, vName, aName, keep, sV, sA) {
       await inst.writeFile('list.txt', new TextEncoder().encode(made.map((p) => "file '" + p + "'").join('\n')));
       ffLog.length = 0;
       const out = 'out.' + v.ext;
-      const ret = await inst.exec(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', ...v.concatExtra, out]);
+      const ret = await inst.exec(['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy',
+        ...(third ? ['-metadata:s:a:1', 'language=' + ((vot && vot.lang) || 'und'), '-disposition:a:0', 'default'] : []),
+        ...v.concatExtra, out]);
       if (ret === 0) {
         try {
           const data = await inst.readFile(out);
@@ -154,7 +173,7 @@ async function copyCutConcat(inst, vName, aName, keep, sV, sA) {
 async function finalize() {
   const inst = await getFF();
   const isMp3 = acc.format === 'mp3';
-  const aName = 'a.' + extFor(acc.audioMime);
+  let aName = 'a.' + extFor(acc.audioMime);
 
   const aBytes = concat(acc.audio);
   acc.audio = [];
@@ -171,7 +190,7 @@ async function finalize() {
   }
 
   // capture may begin mid-video → learn the real file start times
-  const sA = await probeStart(inst, aName);
+  let sA = await probeStart(inst, aName);
   const sV = vName ? await probeStart(inst, vName) : 0;
 
   const start = Math.max(0, Number(acc.start) || 0);
@@ -179,10 +198,69 @@ async function finalize() {
   const effEnd = end > start ? end : Infinity;
   const dur = isFinite(effEnd) ? effEnd - start : 0;
   const limit = dur > 0 ? ['-t', String(dur)] : [];
-  const seekA = start - sA > 0.2 ? ['-ss', String(start - sA)] : [];
-  const seekV = start - sV > 0.2 ? ['-ss', String(start - sV)] : [];
-  const inV = vName ? [...seekV, '-i', vName] : [];
-  const inA = [...seekA, '-i', aName];
+
+  // ---- VOT: встроить переведённую дорожку ----------------------------------
+  // mix/replace заранее готовят единый аудиофайл, чей t=0 соответствует
+  // абсолютному start (aName/sA подменяются) — дальше все существующие ветки
+  // (вырезки, транскод, mp3) работают без правок. track добавляет третий вход.
+  let votTrack = null; // 'vot.mp3', если перевод идёт отдельной дорожкой
+  let votLang3 = 'und';
+  let votApplied = false; // при любом режиме VOT собираем только mp4 (не webm)
+  let origAudio = null; // исходное аудио до микса — для сборки без перевода
+  if (acc.vot) {
+    let mode = acc.vot.mode || 'mix';
+    if (isMp3 && mode === 'track') mode = 'mix'; // в mp3 второй дорожки не бывает
+    votLang3 = { ru: 'rus', en: 'eng', kk: 'kaz' }[acc.vot.lang] || 'und';
+    let votBuf = null;
+    try {
+      votBuf = await votAwait(acc.vot);
+      relayLog('VOT: дорожка перевода получена (' + Math.round(votBuf.length / 1024) + ' КБ), режим ' + mode);
+    } catch (e) {
+      const m = 'Перевод (VOT): ' + String((e && e.message) || e) + ' — сохраняю без перевода';
+      note(m);
+      relayLog(m);
+    }
+    if (votBuf) {
+      await inst.writeFile('vot.mp3', votBuf);
+      if (mode === 'track') {
+        votTrack = 'vot.mp3';
+        votApplied = true;
+      } else {
+        // дорожка перевода начинается с t=0 видео → сик абсолютным start
+        const seekVot = start > 0.2 ? ['-ss', String(start)] : [];
+        const seekOrig = start - sA > 0.2 ? ['-ss', String(start - sA)] : [];
+        const mixArgs = (norm) => [
+          ...seekOrig, '-i', aName, ...seekVot, '-i', 'vot.mp3',
+          '-filter_complex', '[0:a]volume=0.3[o];[o][1:a]amix=inputs=2:duration=first' + norm + '[a]',
+          '-map', '[a]', ...limit, '-c:a', 'aac', '-b:a', '192k', 'mix.m4a',
+        ];
+        const repArgs = [...seekVot, '-i', 'vot.mp3', ...limit, '-c:a', 'aac', '-b:a', '192k', 'mix.m4a'];
+        ffLog.length = 0;
+        ffPhase = 'Подготовка дорожки перевода';
+        let ret = await inst.exec(mode === 'replace' ? repArgs : mixArgs(':normalize=0'));
+        if (ret !== 0 && mode === 'mix') { // старый amix не знает normalize
+          await rm(inst, 'mix.m4a');
+          ret = await inst.exec(mixArgs(''));
+        }
+        if (ret === 0) {
+          await rm(inst, 'vot.mp3');
+          // оригинал не удаляем: если mp4-сборка с переводом не удастся,
+          // второй заход соберёт файл по исходной дорожке
+          origAudio = { name: aName, sA };
+          aName = 'mix.m4a';
+          sA = start;
+          votApplied = true;
+          relayLog('VOT: дорожка перевода подготовлена (' + mode + ')');
+        } else {
+          const m = 'Перевод (VOT): не удалось подготовить дорожку — сохраняю без перевода';
+          note(m);
+          relayLog(m);
+          await rm(inst, 'mix.m4a');
+          await rm(inst, 'vot.mp3');
+        }
+      }
+    }
+  }
 
   let cuts = mergeCuts(acc.sb, start, effEnd);
   let keep = keepList(cuts, start, effEnd);
@@ -193,45 +271,68 @@ async function finalize() {
   let data = null, chosen = null, lastErr = '';
 
   if (!isMp3 && !acc.transcode && cuts.length) {
-    ({ data, chosen, lastErr } = await copyCutConcat(inst, vName, aName, keep, sV, sA));
-    if (!data) console.warn('[Triangle] вырезание в режиме copy не удалось, скачиваю без вырезания:', lastErr);
+    ({ data, chosen, lastErr } = await copyCutConcat(inst, vName, aName, keep, sV, sA,
+      votApplied ? { third: votTrack, lang: votLang3 } : null));
+    if (!data) {
+      console.warn('[Triangle] вырезание в режиме copy не удалось, скачиваю без вырезания:', lastErr);
+      relayLog('вырезание вставок в режиме копирования не удалось — собираю без вырезания');
+    }
   }
 
-  if (!data) {
+  // Сборка — функция, потому что при активном VOT она может прогоняться дважды:
+  // единственный mp4-вариант не собрался → второй заход идёт уже без перевода
+  // (по исходному аудио), чтобы весь захват не пропал из-за перевода.
+  const assemble = async () => {
+    const seekA = start - sA > 0.2 ? ['-ss', String(start - sA)] : [];
+    const seekV = start - sV > 0.2 ? ['-ss', String(start - sV)] : [];
+    const inV = vName ? [...seekV, '-i', vName] : [];
+    const inA = [...seekA, '-i', aName];
     const runs = [];
     if (isMp3) {
       const af = expr ? ['-af', "aselect='not(" + expr + ")',asetpts=N/SR/TB"] : [];
       runs.push({
-        out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
+        out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3', phase: 'Кодирование MP3',
         args: [...inA, ...limit, '-vn', ...af, '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
       });
     } else if (acc.transcode) {
+      const inT = votTrack ? [...(start > 0.2 ? ['-ss', String(start)] : []), '-i', votTrack] : [];
       const maps = expr
         ? ['-filter_complex',
            "[0:v]select='not(" + expr + ")',setpts=N/FRAME_RATE/TB[v];" +
-           "[1:a]aselect='not(" + expr + ")',asetpts=N/SR/TB[a]",
-           '-map', '[v]', '-map', '[a]']
-        : ['-map', '0:v:0', '-map', '1:a:0'];
+           "[1:a]aselect='not(" + expr + ")',asetpts=N/SR/TB[a]" +
+           (votTrack ? ";[2:a]aselect='not(" + expr + ")',asetpts=N/SR/TB[a1]" : ''),
+           '-map', '[v]', '-map', '[a]', ...(votTrack ? ['-map', '[a1]'] : [])]
+        : ['-map', '0:v:0', '-map', '1:a:0', ...(votTrack ? ['-map', '2:a:0'] : [])];
+      const votMeta = votTrack
+        ? ['-metadata:s:a:1', 'language=' + votLang3, '-disposition:a:0', 'default'] : [];
       runs.push({
-        out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-        args: [...inV, ...inA, ...maps, ...limit,
+        out: 'out.mp4', type: 'video/mp4', ext: '.mp4', phase: 'Перекодирование в H.264/AAC',
+        args: [...inV, ...inA, ...inT, ...maps, ...limit,
           '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
-          '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart', 'out.mp4'],
+          '-c:a', 'aac', '-b:a', '160k', ...votMeta, '-movflags', '+faststart', 'out.mp4'],
       });
     } else {
+      const inT = votTrack ? [...(start > 0.2 ? ['-ss', String(start)] : []), '-i', votTrack] : [];
+      const votMaps = votTrack ? ['-map', '2:a:0'] : [];
+      const votCodec = votTrack
+        ? ['-c:a:1', 'aac', '-b:a:1', '160k',
+           '-metadata:s:a:1', 'language=' + votLang3, '-disposition:a:0', 'default'] : [];
       runs.push({
-        out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-        args: [...inV, ...inA, '-map', '0:v:0', '-map', '1:a:0', ...limit,
-          '-c', 'copy', '-strict', '-2', '-movflags', '+faststart', 'out.mp4'],
+        out: 'out.mp4', type: 'video/mp4', ext: '.mp4', phase: 'Склейка дорожек (без перекодирования)',
+        args: [...inV, ...inA, ...inT, '-map', '0:v:0', '-map', '1:a:0', ...votMaps, ...limit,
+          '-c', 'copy', ...votCodec, '-strict', '-2', '-movflags', '+faststart', 'out.mp4'],
       });
-      runs.push({
-        out: 'out.webm', type: 'video/webm', ext: '.webm',
-        args: [...inV, ...inA, '-map', '0:v:0', '-map', '1:a:0', ...limit, '-c', 'copy', 'out.webm'],
-      });
+      if (!votApplied) { // AAC-микс и вторая дорожка несовместимы с webm
+        runs.push({
+          out: 'out.webm', type: 'video/webm', ext: '.webm', phase: 'Склейка дорожек (без перекодирования)',
+          args: [...inV, ...inA, '-map', '0:v:0', '-map', '1:a:0', ...limit, '-c', 'copy', 'out.webm'],
+        });
+      }
     }
 
     for (const run of runs) {
       ffLog.length = 0;
+      ffPhase = run.phase;
       const ret = await inst.exec(run.args);
       if (ret === 0) {
         try {
@@ -243,13 +344,34 @@ async function finalize() {
       await rm(inst, run.out);
     }
     if (chosen) await rm(inst, chosen.out);
+  };
+
+  if (!data) {
+    await assemble();
+    if (!chosen && (votApplied || votTrack)) {
+      const m = 'сборка с переводом не удалась — собираю без перевода';
+      note('Перевод (VOT): ' + m);
+      relayLog('VOT: ' + m + ' (' + lastErr.slice(0, 160) + ')');
+      if (origAudio) { await rm(inst, aName); aName = origAudio.name; sA = origAudio.sA; }
+      votTrack = null;
+      votApplied = false;
+      lastErr = '';
+      await assemble();
+    }
   }
 
   await rm(inst, aName);
+  if (origAudio && origAudio.name !== aName) await rm(inst, origAudio.name);
   if (vName) await rm(inst, vName);
+  await rm(inst, 'vot.mp3');
   acc.video = []; acc.audio = []; acc.sb = [];
 
   if (!chosen) throw new Error(lastErr || 'ffmpeg не собрал файл');
+  // Явный след того, что именно произошло с файлом, — по нему в журнале видно,
+  // было ли перекодирование и попал ли перевод в итог.
+  relayLog('файл собран: ' + chosen.ext.slice(1) +
+    (isMp3 ? '' : acc.transcode ? ', видео перекодировано в H.264' : ', потоки скопированы без перекодирования') +
+    (acc.vot ? (votApplied || votTrack ? ', перевод встроен' : ', без перевода') : ''));
   return saveBlob(data, acc.filename, chosen);
 }
 
@@ -257,7 +379,9 @@ async function saveBlob(data, baseName, chosen) {
   const filename = (baseName || 'video').replace(/\.(mp4|webm|mp3)$/i, '') + chosen.ext;
   const blob = new Blob([data.buffer], { type: chosen.type });
   const url = URL.createObjectURL(blob);
-  const res = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename });
+  // fromRun: у этого сохранения есть запись в журнале запусков — background
+  // допишет туда шаги доставки (субтитры и сам журнал сохраняются без него)
+  const res = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename, fromRun: true });
   setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
   if (!res || !res.ok) throw new Error((res && res.error) || 'save failed');
   // Network uploads happen HERE, not in the background: the finished file already
@@ -269,6 +393,18 @@ async function saveBlob(data, baseName, chosen) {
 // ---- direct uploads (no native helper required) ----------------------------
 function note(message) {
   try { chrome.runtime.sendMessage({ t: 'ytdl-note', message }); } catch (e) {}
+}
+
+// Веха для журнала запусков во время сборки: background ретранслирует её в
+// открытую вкладку, где runStep дописывает шаг в активный запуск.
+function relayLog(msg) {
+  try { chrome.runtime.sendMessage({ t: 'ytdl-run-log', msg }); } catch (e) {}
+}
+
+// Веха после конца запуска (выгрузка готового файла): вкладка уже закрыла
+// запись, поэтому шаг дописывает background прямо в storage.
+function bgLog(msg) {
+  try { chrome.runtime.sendMessage({ t: 'ytdl-runlog-append', msg }); } catch (e) {}
 }
 
 async function hmac(keyBytes, str) {
@@ -340,24 +476,27 @@ async function maybeUpload(blob, filename) {
   let s = {};
   try { s = await chrome.storage.local.get(['dest', 's3cfg', 'wdcfg']); } catch (e) { return; }
   const type = s.dest && s.dest.type;
+  // запуск в журнале уже закрыт — итог выгрузки дописывает background
+  const log = (m) => { note(m); bgLog(m); };
   try {
     if (type === 's3' && s.s3cfg && s.s3cfg.bucket) {
       note('S3: выгружаю ' + filename + '…');
       await s3Put(blob, filename, s.s3cfg);
-      note('S3: выгружено — ' + filename);
+      log('S3: выгружено — ' + filename);
     } else if (type === 'webdav' && s.wdcfg && s.wdcfg.url) {
       note('WebDAV: выгружаю ' + filename + '…');
       await webdavPut(blob, filename, s.wdcfg);
-      note('WebDAV: выгружено — ' + filename);
+      log('WebDAV: выгружено — ' + filename);
     }
   } catch (e) {
-    note('Выгрузка: ошибка — ' + String((e && e.message) || e));
+    log('Выгрузка: ошибка — ' + String((e && e.message) || e));
   }
 }
 
 // ---- parallel merge --------------------------------------------------------
 async function parMerge(msg) {
   const inst = await getFF();
+  ffPhase = 'Сборка фрагментов';
   const state = par[msg.task];
   if (!state) throw new Error('нет данных задачи');
   const isMp3 = msg.format === 'mp3';
@@ -472,6 +611,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return; // sync
   }
 
+  // ---- VOT: запустить перевод заранее, параллельно с захватом ----
+  if (msg.t === 'ytdl-vot-start') {
+    try {
+      votStart(msg);
+      sendResponse({ ok: true });
+    } catch (e) {
+      sendResponse({ ok: false, error: String((e && e.message) || e) });
+    }
+    return; // sync
+  }
+
   // ---- single mode ----
   if (msg.t === 'ytdl-begin') {
     acc.video = []; acc.audio = [];
@@ -483,6 +633,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     acc.start = msg.start || 0;
     acc.end = msg.end || 0;
     acc.sb = Array.isArray(msg.sb) ? msg.sb : [];
+    // {videoId, mode, lang, srcLang, lively} — задание уже крутится в votJobs,
+    // параметры голоса нужны, чтобы найти именно его (см. votKey)
+    acc.vot = msg.vot || null;
     getFF().catch(() => {});
     sendResponse({ ok: true });
     return; // sync

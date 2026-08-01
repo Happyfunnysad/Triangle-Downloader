@@ -122,6 +122,13 @@
   function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; document.removeEventListener('click', onDocClick, true); } }
   function onDocClick(e) { if (menuEl && !menuEl.contains(e.target) && e.target.id !== BTN_ID) closeMenu(); }
 
+  // Меню пересоздаётся при каждом открытии, поэтому слушатель хранилища живёт
+  // здесь и лишь вызывает актуальный обработчик открытого меню.
+  let onAuthChange = null;
+  chrome.storage.onChanged.addListener((ch, area) => {
+    if (area === 'local' && ch.votAuth && onAuthChange) onAuthChange(ch.votAuth.newValue || {});
+  });
+
   // small segmented control: [{key,label}] → {node, set(key)}
   function optionRow(options, current, onPick) {
     const wrap = el('span', 'ytdl-opts');
@@ -203,14 +210,25 @@
     const uniq = [...new Set(heights)].sort((a, b) => b - a);
 
     let store = {};
-    try { store = await chrome.storage.local.get(['transcode', 'sbCut', 'parTabs', 'parChunk']); }
-    catch (e) { /* fall back to defaults rather than losing the menu */ }
+    try {
+      store = await chrome.storage.local.get(['transcode', 'sbCut', 'parTabs', 'parChunk',
+        'votOn', 'votMode', 'votLang', 'votSrcLang', 'votLively', 'votAuth',
+        'votProxy', 'votProxyCfg']);
+    } catch (e) { /* fall back to defaults rather than losing the menu */ }
     const cfg = {
       transcode: !!store.transcode,
       sbCut: store.sbCut !== false,
       parTabs: String(store.parTabs == null ? 'auto' : store.parTabs),
       parChunk: String(Number(store.parChunk) || 12),
+      votOn: !!store.votOn,
+      votMode: store.votMode || 'mix',
+      votLang: store.votLang || 'ru',
+      votSrcLang: store.votSrcLang || 'auto',
+      votLively: !!store.votLively,
+      votProxy: !!store.votProxy,
     };
+    let votAuth = store.votAuth || {};
+    const votProxyCfg = store.votProxyCfg || {};
 
     const formats = uniq.map((h) => ({ key: 'v' + h, label: h + 'p', kind: 'video', height: h }))
       .concat([
@@ -332,11 +350,12 @@
       while (destRow.firstChild) destRow.removeChild(destRow.firstChild);
       destRow.appendChild(pill('local', '↓', 'Локально'));
       const t = targets;
-      if (t.s3cfg && t.s3cfg.bucket) destRow.appendChild(pill('s3', 'S3', t.s3cfg.bucket));
-      if (t.wdcfg && t.wdcfg.url) destRow.appendChild(pill('webdav', 'DAV', (() => { try { return new URL(t.wdcfg.url).host; } catch (e) { return 'WebDAV'; } })()));
-      if (t.ftpcfg && t.ftpcfg.host) destRow.appendChild(pill('ftp', 'FTP', t.ftpcfg.host));
-      if (t.smbDir) destRow.appendChild(pill('smb', 'NAS', t.smbDir.split('/').pop() || 'шара'));
-      if (t.tdTarget) destRow.appendChild(pill('taildrop', 'TS', t.tdTarget));
+      // получатель показывается, только если его настройки прошли проверку
+      if (t.s3cfg && t.s3cfg.bucket && destOk('s3cfg', t.s3cfg)) destRow.appendChild(pill('s3', 'S3', t.s3cfg.bucket));
+      if (t.wdcfg && t.wdcfg.url && destOk('wdcfg', t.wdcfg)) destRow.appendChild(pill('webdav', 'DAV', (() => { try { return new URL(t.wdcfg.url).host; } catch (e) { return 'WebDAV'; } })()));
+      if (t.ftpcfg && t.ftpcfg.host && destOk('ftpcfg', t.ftpcfg)) destRow.appendChild(pill('ftp', 'FTP', t.ftpcfg.host));
+      if (t.smbDir) destRow.appendChild(pill('smb', 'NAS', t.smbDir.split(/[\\/]/).filter(Boolean).pop() || 'шара'));
+      if (t.tdTarget) destRow.appendChild(pill('taildrop', 'TS', t.tdLabel || t.tdTarget));
       const add = el('button', 'ytdl-pill ytdl-pill-add', '+');
       add.title = 'настроить получателей';
       add.addEventListener('click', (ev) => { ev.stopPropagation(); showPane('settings'); });
@@ -345,14 +364,14 @@
         dest === 's3' ? 's3://' + t.s3cfg.bucket + '/' + ((t.s3cfg.prefix || '').replace(/^\/+|\/+$/g, '')) + '/'
         : dest === 'webdav' ? t.wdcfg.url
         : dest === 'ftp' ? 'ftp://' + t.ftpcfg.host + '/' + (t.ftpcfg.dir || '')
-        : dest === 'smb' ? 'smb://' + String(t.smbDir).replace(/^\/Volumes\//, '')
-        : dest === 'taildrop' ? 'taildrop → ' + t.tdTarget
+        : dest === 'smb' ? String(t.smbDir).replace(/^\/Volumes\//, 'smb://')
+        : dest === 'taildrop' ? 'taildrop → ' + (t.tdLabel || t.tdTarget)
         : 'папка загрузок браузера';
     }
 
     async function reloadDest() {
       let s = {};
-      try { s = await chrome.storage.local.get(['dest', 's3cfg', 'wdcfg', 'ftpcfg', 'smbDir', 'tdTarget']); } catch (e) {}
+      try { s = await chrome.storage.local.get(['dest', 's3cfg', 'wdcfg', 'ftpcfg', 'smbDir', 'tdTarget', 'tdLabel']); } catch (e) {}
       targets = s;
       const valid = {
         local: true,
@@ -389,7 +408,8 @@
     const chipSb = el('button');
     const chipTabs = el('button');
     const chipCodec = el('button');
-    [chipSb, chipTabs, chipCodec].forEach((c) => {
+    const chipVot = el('button');
+    [chipSb, chipTabs, chipCodec, chipVot].forEach((c) => {
       c.addEventListener('click', (ev) => { ev.stopPropagation(); showPane('settings'); });
       chips.appendChild(c);
     });
@@ -418,6 +438,77 @@
       [{ key: 'fast', label: 'Быстро' }, { key: 'h264', label: 'H.264' }],
       cfg.transcode ? 'h264' : 'fast',
       (k) => { cfg.transcode = k === 'h264'; chrome.storage.local.set({ transcode: cfg.transcode }); renderChips(); }));
+    // ---- VOT: закадровый перевод Яндекса ------------------------------------
+    settings.appendChild(el('div', 'ytdl-sec', 'Перевод'));
+    settings.appendChild(settingRow('Перевод (VOT)',
+      'закадровый перевод Яндекса; дорожка готовится на сервере — обычно пара минут; отключает параллельные вкладки',
+      [{ key: 'off', label: 'Выкл' }, { key: 'on', label: 'Вкл' }],
+      cfg.votOn ? 'on' : 'off',
+      (k) => { cfg.votOn = k === 'on'; chrome.storage.local.set({ votOn: cfg.votOn }); renderChips(); }));
+    settings.appendChild(settingRow('Режим',
+      'поверх — оригинал тише + перевод; вместо — только перевод; дорожка — 2 дорожки (mp4)',
+      [{ key: 'mix', label: 'Поверх' }, { key: 'replace', label: 'Вместо' }, { key: 'track', label: 'Дорожка' }],
+      cfg.votMode,
+      (k) => { cfg.votMode = k; chrome.storage.local.set({ votMode: k }); }));
+    settings.appendChild(settingRow('Язык перевода',
+      'русский, английский или казахский',
+      [{ key: 'ru', label: 'RU' }, { key: 'en', label: 'EN' }, { key: 'kk', label: 'KK' }],
+      cfg.votLang,
+      (k) => { cfg.votLang = k; chrome.storage.local.set({ votLang: k }); renderChips(); }));
+    settings.appendChild(settingRow('Язык оригинала',
+      '«авто» — Яндекс определит сам',
+      [{ key: 'auto', label: 'Авто' }, { key: 'en', label: 'EN' }, { key: 'ru', label: 'RU' }],
+      cfg.votSrcLang,
+      (k) => { cfg.votSrcLang = k; chrome.storage.local.set({ votSrcLang: k }); }));
+    settings.appendChild(settingRow('Живой голос',
+      'нейросетевые голоса Яндекса — нужен вход в аккаунт, только для перевода на русский',
+      [{ key: 'off', label: 'Выкл' }, { key: 'on', label: 'Вкл' }],
+      cfg.votLively ? 'on' : 'off',
+      (k) => { cfg.votLively = k === 'on'; chrome.storage.local.set({ votLively: cfg.votLively }); }));
+
+    // вход в Яндекс — отдельным окном, пароль вводится на стороне Яндекса
+    const authRow = el('div', 'ytdl-row');
+    const authTop = el('div', 'ytdl-row-top');
+    const authState = el('span');
+    const authBtn = el('button', 'ytdl-mini');
+    authBtn.style.marginLeft = 'auto';
+    authTop.appendChild(authState);
+    authTop.appendChild(authBtn);
+    authRow.appendChild(authTop);
+    authRow.appendChild(el('div', 'ytdl-hint',
+      'вход открывается в окне Яндекса через сервис автора VOT'));
+    function renderAuth() {
+      const ok = votAuth.token && (!votAuth.expires || votAuth.expires > Date.now());
+      authState.textContent = ok ? 'Аккаунт Яндекса: выполнен вход' : 'Аккаунт Яндекса: не выполнен вход';
+      authBtn.textContent = ok ? 'Выйти' : 'Войти';
+    }
+    authBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      const ok = votAuth.token && (!votAuth.expires || votAuth.expires > Date.now());
+      if (ok) {
+        votAuth = {};
+        await chrome.storage.local.remove('votAuth');
+        renderAuth();
+        return;
+      }
+      authBtn.textContent = 'Открываю…';
+      try { await chrome.runtime.sendMessage({ t: 'ytdl-vot-login' }); } catch (e) {}
+      renderAuth();
+    });
+    // вход происходит в отдельном окне — слушаем хранилище, чтобы строка ожила
+    // сразу после него (слушатель один на страницу, см. onAuthChange)
+    onAuthChange = (v) => { votAuth = v; renderAuth(); };
+    renderAuth();
+    settings.appendChild(authRow);
+
+    settings.appendChild(settingRow('Ретранслятор',
+      'Яндекс отвечает 402 на запросы из-за пределов СНГ; обход шлёт ссылку на видео через сторонний сервер',
+      [{ key: 'off', label: 'Выкл' }, { key: 'on', label: 'Вкл' }],
+      cfg.votProxy ? 'on' : 'off',
+      (k) => { cfg.votProxy = k === 'on'; chrome.storage.local.set({ votProxy: cfg.votProxy }); }));
+    settings.appendChild(fieldGrid([
+      { k: 'host', ph: 'адрес ретранслятора (vot-worker.eu.cc)', val: votProxyCfg.host, wide: true },
+    ], 'votProxyCfg'));
     // ---- delivery targets ---------------------------------------------------
     // Two classes, deliberately separated:
     //   * S3 / WebDAV — uploaded straight from the extension, no helper, always on;
@@ -426,9 +517,25 @@
     //     errors on open: the base extension must behave exactly as before.
     settings.appendChild(el('div', 'ytdl-sec', 'Получатели'));
 
+    // Поля сохраняются всегда — иначе наполовину заполненная форма пропадала бы
+    // при закрытии меню. Но получатель с ошибками не попадает в «Куда»:
+    // непроверенные данные всплыли бы уже во время выгрузки готового файла.
     function fieldGrid(fields, saveKey) {
+      const wrap = el('div');
       const grid = el('div', 'ytdl-fgrid');
+      const errBox = el('div', 'ytdl-err');
       const inputs = {};
+
+      const recheck = () => {
+        const out = {};
+        for (const k of Object.keys(inputs)) out[k] = inputs[k].value.trim();
+        const errs = destErrors(saveKey, out);
+        for (const k of Object.keys(inputs)) inputs[k].classList.toggle('bad', !!errs[k]);
+        const msgs = Object.keys(errs).map((k) => errs[k]);
+        errBox.textContent = msgs.length ? msgs.join(' · ') : '';
+        return out;
+      };
+
       for (const f of fields) {
         const i = document.createElement('input');
         i.className = 'ytdl-f';
@@ -438,16 +545,26 @@
         if (f.secret) i.type = 'password';
         if (f.wide) i.classList.add('wide');
         i.addEventListener('click', (ev) => ev.stopPropagation());
+        i.addEventListener('input', () => { if (errBox.textContent) recheck(); });
         i.addEventListener('change', async () => {
-          const out = {};
-          for (const k of Object.keys(inputs)) out[k] = inputs[k].value.trim();
+          const out = recheck();
+          if (saveKey === 'votProxyCfg' && out.host) {
+            // vot.js подставляет https:// сам — вставленные схема и путь сломали бы URL
+            out.host = out.host.replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+            inputs.host.value = out.host;
+          }
           try { await chrome.storage.local.set({ [saveKey]: out }); } catch (e) {}
           reloadDest();
         });
         inputs[f.k] = i;
         grid.appendChild(i);
       }
-      return grid;
+
+      wrap.appendChild(grid);
+      wrap.appendChild(errBox);
+      // уже сохранённые данные тоже могут быть с изъяном — показываем сразу
+      if (fields.some((f) => f.val)) recheck();
+      return wrap;
     }
 
     const s3 = targets.s3cfg || {};
@@ -471,7 +588,9 @@
 
     // helper presence decides how the next three rows behave
     let haveHelper = false;
-    const HELP_HINT = 'нужен помощник: native/install.sh <id расширения>';
+    const HELP_HINT = /Windows/i.test(navigator.userAgent)
+      ? 'нужен помощник: native\\install.ps1 <id расширения>'
+      : 'нужен помощник: native/install.sh <id расширения>';
 
     const ftp = targets.ftpcfg || {};
     const ftpHint = el('div', 'ytdl-hint', 'FTP — через помощника');
@@ -494,6 +613,14 @@
     tdRow.appendChild(tdHint);
     settings.appendChild(tdRow);
 
+    // Сетевая папка задаётся путём — так работает всегда. Список подключённых
+    // и поиск по сети — вспомогательные: список бывает пуст (в Windows папку
+    // можно открыть по \\сервер\шара, не подключая диск), а поиск зависит от
+    // службы обзора сети и часто молчит, поэтому он под кнопкой, а не сам собой.
+    const IS_WIN_UI = /Windows/i.test(navigator.userAgent);
+    const SMB_HINT = IS_WIN_UI
+      ? 'путь вида \\\\сервер\\шара — подключать сетевой диск необязательно'
+      : 'путь смонтированной шары, например /Volumes/video';
     const smbRow = el('div', 'ytdl-row');
     const smbTop = el('div', 'ytdl-row-top');
     smbTop.appendChild(el('span', null, 'Сетевая папка'));
@@ -502,7 +629,13 @@
     const smbScan = el('button', 'ytdl-mini', 'искать');
     smbTop.appendChild(smbScan);
     smbRow.appendChild(smbTop);
-    const smbHint = el('div', 'ytdl-hint', 'смонтированная SMB-шара');
+    const smbPath = document.createElement('input');
+    smbPath.className = 'ytdl-f wide';
+    smbPath.placeholder = IS_WIN_UI ? '\\\\nas\\video' : '/Volumes/video';
+    smbPath.spellcheck = false;
+    smbPath.addEventListener('click', (ev) => ev.stopPropagation());
+    smbRow.appendChild(smbPath);
+    const smbHint = el('div', 'ytdl-hint', SMB_HINT);
     smbRow.appendChild(smbHint);
     settings.appendChild(smbRow);
 
@@ -521,12 +654,12 @@
       try { ping = await chrome.runtime.sendMessage({ t: 'ytdl-td-ping' }); } catch (e) {}
       haveHelper = !!(ping && (ping.ok || ping.pong || ping.tailscale !== undefined));
       if (!haveHelper) {
-        tdPick.disabled = smbPick.disabled = smbScan.disabled = true;
+        tdPick.disabled = smbPick.disabled = smbScan.disabled = smbPath.disabled = true;
         tdHint.textContent = smbHint.textContent = HELP_HINT;
         ftpHint.textContent = 'FTP — ' + HELP_HINT;
         return;
       }
-      tdPick.disabled = smbPick.disabled = smbScan.disabled = false;
+      tdPick.disabled = smbPick.disabled = smbScan.disabled = smbPath.disabled = false;
 
       const [devs, mounted, st] = await Promise.all([
         chrome.runtime.sendMessage({ t: 'ytdl-td-devices' }).catch(() => null),
@@ -536,10 +669,22 @@
       if (devs && devs.ok && devs.devices.length) {
         for (const d of devs.devices) {
           const o = el('option', null, d.name + (d.online ? '' : ' (офлайн)'));
-          o.value = d.host;
+          // адресом, а не именем: имена бывают с апострофами и кириллицей,
+          // 100.x.y.z доезжает до помощника без потерь
+          o.value = d.ip || d.host;
           tdPick.appendChild(o);
         }
-        if (st.tdTarget) tdPick.value = st.tdTarget;
+        if (st.tdTarget) {
+          tdPick.value = st.tdTarget;
+          // сохранённое имя из прошлых версий — переводим на адрес
+          if (!tdPick.value) {
+            const same = devs.devices.find((d) => d.host === st.tdTarget || d.name === st.tdTarget);
+            if (same) {
+              tdPick.value = same.ip || same.host;
+              chrome.storage.local.set({ tdTarget: tdPick.value }).catch(() => {});
+            }
+          }
+        }
         tdHint.textContent = 'устройство Tailscale';
       } else {
         tdHint.textContent = (devs && devs.error) || 'в вашей сети нет других устройств';
@@ -550,23 +695,53 @@
           o.value = m.path;
           smbPick.appendChild(o);
         }
-        if (st.smbDir) smbPick.value = st.smbDir;
-        smbHint.textContent = mounted.mounted.length
-          ? 'смонтированная SMB-шара'
-          : 'шар нет — «искать» покажет серверы, монтировать в Finder (⌘K)';
+        if (st.smbDir) {
+          smbPick.value = st.smbDir;
+          if (!smbPick.value) smbPath.value = st.smbDir; // задано вручную
+        }
+        smbHint.textContent = SMB_HINT;
       }
     }
     loadHelperRows();
 
     [tdPick, smbPick].forEach((p) => p.addEventListener('click', (ev) => ev.stopPropagation()));
     tdPick.addEventListener('change', async () => {
-      await chrome.storage.local.set({ tdTarget: tdPick.value || null }).catch(() => {});
+      // отправляем на адрес, а показываем имя — пользователю адрес ни о чём не говорит
+      const label = tdPick.selectedOptions[0] ? tdPick.selectedOptions[0].textContent : '';
+      await chrome.storage.local.set({
+        tdTarget: tdPick.value || null,
+        tdLabel: tdPick.value ? label.replace(' (офлайн)', '') : null,
+      }).catch(() => {});
+      // Устройство выбирают ради отправки: если в «Куда» стоит «Локально»,
+      // сразу переключаем на Taildrop. Иначе пилюля лишь появляется, доставка
+      // молча не происходит, и это выглядит как «ничего не отправилось».
+      if (tdPick.value) {
+        try {
+          const { dest: d } = await chrome.storage.local.get('dest');
+          if (!d || d.type === 'local') await chrome.storage.local.set({ dest: { type: 'taildrop' } });
+        } catch (e) {}
+      }
       reloadDest();
     });
     smbPick.addEventListener('change', async () => {
+      smbPath.value = smbPick.value || '';
       await chrome.storage.local.set({ smbDir: smbPick.value || null }).catch(() => {});
       reloadDest();
     });
+    const saveSmbPath = async () => {
+      const v = smbPath.value.trim();
+      const bad = v && !(IS_WIN_UI ? /^\\\\[^\\]+\\[^\\]/.test(v) || /^[a-zA-Z]:\\/.test(v) : v.startsWith('/'));
+      smbPath.classList.toggle('bad', !!bad);
+      smbHint.textContent = bad
+        ? (IS_WIN_UI ? 'путь должен начинаться с \\\\сервер\\шара или с буквы диска' : 'путь должен начинаться с /')
+        : SMB_HINT;
+      if (bad) return;
+      if (v) smbPick.value = ''; // ручной путь важнее выбранного из списка
+      await chrome.storage.local.set({ smbDir: v || null }).catch(() => {});
+      reloadDest();
+    };
+    smbPath.addEventListener('change', saveSmbPath);
+    smbPath.addEventListener('input', () => { if (smbPath.classList.contains('bad')) saveSmbPath(); });
     smbScan.addEventListener('click', async (ev) => {
       ev.stopPropagation();
       smbScan.disabled = true;
@@ -576,10 +751,35 @@
       smbScan.disabled = false;
       if (!r || !r.ok) { smbHint.textContent = (r && r.error) || 'поиск не удался'; return; }
       smbHint.textContent = r.servers.length
-        ? 'найдено: ' + r.servers.map((s) => s.name).join(', ') + ' — монтируйте в Finder (⌘K)'
-        : 'серверы SMB не найдены';
+        ? 'найдено: ' + r.servers.map((s) => s.name).join(', ') + ' — впишите путь до нужной папки'
+        : (r.hint || 'серверы не найдены — впишите путь вручную');
       loadHelperRows();
     });
+
+    // ---- журнал запусков ----------------------------------------------------
+    const logRow = el('div', 'ytdl-row');
+    const logTop = el('div', 'ytdl-row-top');
+    logTop.appendChild(el('span', null, 'Журнал запусков'));
+    const logBtn = el('button', 'ytdl-mini', 'Скачать JSON');
+    logBtn.style.marginLeft = 'auto';
+    logTop.appendChild(logBtn);
+    logRow.appendChild(logTop);
+    logRow.appendChild(el('div', 'ytdl-hint',
+      'последние ' + RUNLOG_MAX + ' запусков: настройки, получатели и шаги; пароли и токены — маской'));
+    logBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      let list = [];
+      try { list = (await chrome.storage.local.get(RUNLOG_KEY))[RUNLOG_KEY] || []; } catch (e) {}
+      if (!list.length) { logBtn.textContent = 'журнал пуст'; setTimeout(() => { logBtn.textContent = 'Скачать JSON'; }, 2500); return; }
+      const url = 'data:application/json;charset=utf-8,' +
+        encodeURIComponent(JSON.stringify(list, null, 2));
+      try {
+        const r = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename: 'triangle-runlog.json', noDeliver: true });
+        logBtn.textContent = r && r.ok ? 'сохранён' : 'не удалось';
+      } catch (e) { logBtn.textContent = 'не удалось'; }
+      setTimeout(() => { logBtn.textContent = 'Скачать JSON'; }, 2500);
+    });
+    settings.appendChild(logRow);
 
     const back = el('button', 'ytdl-back', '‹ назад к загрузке');
     back.addEventListener('click', (ev) => { ev.stopPropagation(); showPane('main'); });
@@ -601,6 +801,8 @@
       chipSb.classList.toggle('on', cfg.sbCut);
       chipTabs.textContent = cfg.parTabs === 'auto' ? 'вкладок: авто' : 'вкладок: ' + cfg.parTabs;
       chipCodec.textContent = cfg.transcode ? 'H.264' : 'VP9';
+      chipVot.textContent = cfg.votOn ? 'VOT: ' + cfg.votLang.toUpperCase() : 'VOT: выкл';
+      chipVot.classList.toggle('on', cfg.votOn);
     }
 
     function render() {
@@ -698,17 +900,213 @@
       const bar = el('div', 'ytdl-toast-bar'); bar.appendChild(el('i'));
       box.appendChild(bar);
       box.appendChild(el('span', 'ytdl-toast-txt'));
+      const copy = el('button', 'ytdl-toast-copy', 'Скопировать отчёт');
+      copy.style.display = 'none';
+      box.appendChild(copy);
       document.body.appendChild(box);
     }
+    const copyBtn = box.querySelector('.ytdl-toast-copy');
+    const hideTimer = { id: null };
+    const arm = (delay) => {
+      clearTimeout(hideTimer.id);
+      hideTimer.id = setTimeout(() => box.classList.remove('show'), delay || 0);
+    };
     return {
       set(txt, pct) {
+        copyBtn.style.display = 'none';
         box.querySelector('.ytdl-toast-txt').textContent = txt;
         box.querySelector('.ytdl-toast-pct').textContent = Math.round((pct || 0) * 100) + '%';
         box.querySelector('.ytdl-toast-bar i').style.width = Math.round((pct || 0) * 100) + '%';
+        clearTimeout(hideTimer.id);
         box.classList.add('show');
       },
-      hide(delay) { setTimeout(() => box.classList.remove('show'), delay || 0); },
+      hide(delay) { arm(delay); },
+      // Ошибку почти всегда надо кому-то переслать, а выделить текст в тосте
+      // нельзя — он исчезает. Поэтому рядом с сообщением живёт кнопка, кладущая
+      // в буфер обмена и саму ошибку, и обстановку, в которой она случилась.
+      fail(err, ctx) {
+        this.set('Ошибка: ' + ((err && err.message) || err), 1);
+        const report = buildReport(err, ctx);
+        console.error('[Triangle]', err, report);
+        copyBtn.textContent = 'Скопировать отчёт';
+        copyBtn.style.display = '';
+        copyBtn.onclick = async (ev) => {
+          ev.stopPropagation();
+          clearTimeout(hideTimer.id); // читают отчёт — тост не должен убегать
+          try {
+            await navigator.clipboard.writeText(report);
+            copyBtn.textContent = 'Скопировано';
+          } catch (e) {
+            copyBtn.textContent = 'Не вышло — отчёт в консоли (F12)';
+          }
+          arm(20000);
+        };
+        arm(30000); // ошибку читают дольше, чем «Готово»
+      },
     };
+  }
+
+  // Всё, что нужно для разбора, кроме секретов: токен Яндекса и пароли получателей
+  // сюда не попадают.
+  function buildReport(err, ctx) {
+    const c = ctx || {};
+    const v = (x, dash) => (x == null || x === '' ? (dash || '—') : String(x));
+    const lines = [
+      'Triangle Downloader ' + (chrome.runtime.getManifest().version || '?') + ' — отчёт об ошибке',
+      'Когда: ' + new Date().toISOString(),
+      'Ошибка: ' + ((err && err.message) || err),
+    ];
+    if (err && err.stack) lines.push('Стек: ' + String(err.stack).split('\n').slice(0, 4).join(' | '));
+    lines.push(
+      'Шаг: ' + v(c.stage),
+      'Задача: ' + v(c.format) + (c.height ? ' ' + c.height + 'p' : '') +
+        ', фрагмент ' + v(c.start, '0') + '–' + v(c.end, '?') + ' из ' + v(c.duration, '?') + ' с' +
+        ', перекодирование: ' + (c.transcode ? 'да' : 'нет'),
+      'SponsorBlock: ' + (c.sbCut === false ? 'выкл' : 'вкл') +
+        (c.sbCount != null ? ', вставок ' + c.sbCount : ''),
+      'Вкладки: ' + v(c.parTabs) + (c.parallel ? ' (параллельный режим)' : ''),
+      'Получатель: ' + v(c.dest, 'локально'),
+    );
+    if (c.vot) {
+      lines.push('VOT: вкл, режим ' + v(c.vot.mode) + ', ' + v(c.vot.srcLang) + ' → ' + v(c.vot.lang) +
+        ', живой голос: ' + (c.vot.lively ? 'да' : 'нет') +
+        ', вход: ' + (c.authOk ? 'есть' : 'нет') +
+        ', ретранслятор: ' + (c.votProxy ? 'вкл' : 'выкл'));
+    } else {
+      lines.push('VOT: выкл');
+    }
+    lines.push(
+      'Видео: ' + v(c.videoId),
+      'Браузер: ' + navigator.userAgent,
+    );
+    return lines.join('\n');
+  }
+
+  // Проверка настроек получателя: {поле: причина}. Пустой объект — можно
+  // отправлять. Правила совпадают с тем, что примет принимающая сторона (имя
+  // сервера — теми же символами, что проверяет помощник), чтобы отказ случался
+  // здесь, а не через полчаса после скачивания.
+  function destErrors(kind, c) {
+    const e = {};
+    const httpUrl = (v) => {
+      try {
+        const u = new URL(v);
+        return u.protocol === 'http:' || u.protocol === 'https:';
+      } catch (err) { return false; }
+    };
+    const hostOk = (v) => /^[a-zA-Z0-9.\-_]+$/.test(v);
+    const filled = (o) => Object.keys(o).some((k) => o[k]);
+
+    if (kind === 's3cfg') {
+      if (!filled(c)) return e; // пустая форма — не ошибка, просто не настроено
+      if (!c.endpoint) e.endpoint = 'нужен адрес S3';
+      else if (!httpUrl(c.endpoint)) e.endpoint = 'адрес должен начинаться с https://';
+      if (!c.bucket) e.bucket = 'нужен bucket';
+      else if (!/^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$/.test(c.bucket)) e.bucket = 'bucket: строчные буквы, цифры, точка, дефис';
+      if (!c.region) e.region = 'нужен регион (например us-east-1)';
+      else if (!/^[a-z0-9\-]+$/.test(c.region)) e.region = 'регион: строчные буквы, цифры, дефис';
+      if (!c.key) e.key = 'нужен access key';
+      if (!c.secret) e.secret = 'нужен secret key';
+    }
+
+    if (kind === 'wdcfg') {
+      if (!filled(c)) return e;
+      if (!c.url) e.url = 'нужен адрес WebDAV';
+      else if (!httpUrl(c.url)) e.url = 'адрес должен начинаться с http:// или https://';
+      if (c.pass && !c.user) e.user = 'пароль без логина';
+    }
+
+    if (kind === 'votProxyCfg') {
+      if (c.host && !hostOk(c.host.replace(/^https?:\/\//, '').split('/')[0])) {
+        e.host = 'адрес: буквы, цифры, точка, дефис';
+      }
+      return e;
+    }
+
+    if (kind === 'ftpcfg') {
+      if (!filled(c)) return e;
+      if (!c.host) e.host = 'нужен адрес сервера';
+      else if (!hostOk(c.host)) e.host = 'адрес: буквы, цифры, точка, дефис — без ftp:// и слэшей';
+      if (c.port && !(Number(c.port) >= 1 && Number(c.port) <= 65535)) e.port = 'порт: число от 1 до 65535';
+      if (c.dir && /(^|\/)\.\.(\/|$)/.test(c.dir)) e.dir = 'в пути нельзя «..»';
+      if (c.pass && !c.user) e.user = 'пароль без логина';
+    }
+
+    return e;
+  }
+  const destOk = (kind, cfg) => Object.keys(destErrors(kind, cfg || {})).length === 0;
+
+  // ---- журнал запусков ------------------------------------------------------
+  // Каждый запуск пишется в chrome.storage.local как JSON: настройки на момент
+  // старта, получатели и шаги с временными метками. Хранится 15 последних.
+  // Пароли, ключи и токены в журнал попадают только маской (журнал существует,
+  // чтобы им делиться, — целые секреты в нём были бы утечкой).
+  const RUNLOG_KEY = 'runLogs';
+  const RUNLOG_MAX = 15;
+  let curRun = null;
+  let runSaving = Promise.resolve(); // записи строго по очереди
+
+  function maskSecret(v) {
+    const s = String(v || '');
+    return s ? s.slice(0, 3) + '…(' + s.length + ' зн.)' : '';
+  }
+  function maskCreds(obj) {
+    const out = {};
+    for (const k of Object.keys(obj || {})) {
+      out[k] = /pass|secret|token|key/i.test(k) ? maskSecret(obj[k]) : obj[k];
+    }
+    return out;
+  }
+
+  function runPersist() {
+    const snap = curRun;
+    runSaving = runSaving.then(async () => {
+      if (!snap) return;
+      let list = [];
+      try { list = (await chrome.storage.local.get(RUNLOG_KEY))[RUNLOG_KEY] || []; } catch (e) {}
+      const i = list.findIndex((r) => r.id === snap.id);
+      if (i >= 0) list[i] = snap; else list.push(snap);
+      while (list.length > RUNLOG_MAX) list.shift();
+      try { await chrome.storage.local.set({ [RUNLOG_KEY]: list }); } catch (e) {}
+    }).catch(() => {});
+    return runSaving;
+  }
+
+  async function runStart(task) {
+    let all = {};
+    try { all = await chrome.storage.local.get(null); } catch (e) {}
+    delete all[RUNLOG_KEY];
+    const credentials = {};
+    for (const k of ['s3cfg', 'wdcfg', 'ftpcfg', 'votAuth']) {
+      if (all[k]) { credentials[k] = maskCreds(all[k]); delete all[k]; }
+    }
+    curRun = {
+      id: Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+      startedAt: new Date().toISOString(),
+      version: chrome.runtime.getManifest().version,
+      browser: navigator.userAgent,
+      task,                 // что качаем: формат, диапазон, videoId
+      settings: all,        // все настройки плагина на момент старта
+      credentials,          // получатели, секреты маскированы
+      steps: [],
+      result: 'выполняется',
+    };
+    runStep('запуск');
+  }
+
+  function runStep(msg, data) {
+    if (!curRun) return;
+    curRun.steps.push(Object.assign({ t: new Date().toISOString(), msg }, data ? { data } : {}));
+    runPersist();
+  }
+
+  function runEnd(result, err) {
+    if (!curRun) return;
+    curRun.result = result;
+    if (err) curRun.error = String((err && err.message) || err);
+    curRun.finishedAt = new Date().toISOString();
+    runPersist();
+    curRun = null;
   }
 
   function safeName(s) {
@@ -733,9 +1131,7 @@
       t.set('Готово: ' + filename, 1);
       t.hide(4000);
     } catch (err) {
-      t.set('Ошибка: ' + (err.message || err), 1);
-      t.hide(6000);
-      console.error('[Triangle]', err);
+      t.fail(err, { stage: 'субтитры', format: 'txt', videoId: info.videoId, duration: info.duration });
     }
   }
 
@@ -764,16 +1160,66 @@
     const { transcode = false, sbCut = true } = await chrome.storage.local.get(['transcode', 'sbCut']);
     const doTranscode = isMp3 ? true : !!transcode; // mp3 always encodes
 
+    // ---- VOT: запустить перевод СРАЗУ — он готовится на сервере Яндекса
+    // параллельно с захватом, offscreen дождётся его в finalize
+    const vs = await chrome.storage.local.get(['votOn', 'votMode', 'votLang', 'votSrcLang',
+      'votLively', 'votAuth', 'votProxy', 'votProxyCfg', 'dest']);
+    const auth = vs.votAuth || {};
+    const authOk = !!(auth.token && (!auth.expires || auth.expires > Date.now()));
+    // обстановка для отчёта об ошибке: дополняется по ходу дела
+    const ctx = {
+      stage: 'подготовка', format, height, start, end, duration,
+      transcode: doTranscode, sbCut, videoId: info.videoId,
+      // эффективный получатель на момент старта — по нему в журнале видно,
+      // должна ли была случиться доставка вообще
+      dest: (vs.dest && vs.dest.type) || 'local',
+    };
+    await runStart({ type: 'video', format, height, start, end, duration, videoId: info.videoId,
+      dest: ctx.dest });
+    const votLang = vs.votLang || 'ru';
+    const vot = vs.votOn ? {
+      videoId: info.videoId,
+      mode: vs.votMode || 'mix',
+      lang: votLang,
+      srcLang: vs.votSrcLang || 'auto',
+      // живой голос Яндекс даёт только на русский и только со входом в аккаунт;
+      // эти же поля образуют ключ задания, поэтому значение должно быть честным
+      lively: !!vs.votLively && authOk && votLang === 'ru',
+    } : null;
+    if (vot) {
+      t.set('Перевод (VOT): отправляю запрос…', 0.02);
+      toOffscreen({
+        t: 'ytdl-vot-start',
+        videoId: vot.videoId,
+        url: 'https://youtu.be/' + info.videoId,
+        duration: info.duration || 0,
+        title: info.title || '',
+        lang: vot.lang,
+        srcLang: vot.srcLang,
+        lively: vot.lively,
+        token: authOk ? auth.token : '',
+        proxy: vs.votProxy ? ((vs.votProxyCfg && vs.votProxyCfg.host) || 'vot-worker.eu.cc') : '',
+      }).catch(() => {}); // не фатально: finalize сохранит файл без перевода
+      runStep('VOT: запрос перевода отправлен',
+        { lang: vot.lang, srcLang: vot.srcLang, mode: vot.mode, lively: vot.lively, proxy: !!vs.votProxy });
+    }
+    ctx.vot = vot;
+    ctx.authOk = authOk;
+    ctx.votProxy = !!vs.votProxy;
+
     let sbSegments = [];
     if (sbCut !== false) {
       t.set('SponsorBlock: проверяю сегменты…', 0.02);
       sbSegments = await fetchSponsorSegments(info.videoId, start, end);
+      runStep('SponsorBlock: вставок ' + sbSegments.length);
     }
     const sbNote = sbSegments.length
       ? ' (вырезаю вставок: ' + sbSegments.length + ')' : '';
+    ctx.sbCount = sbSegments.length;
 
     // ---- parallel path for long ranges ----
     const { parTabs = 'auto', parChunk = 12 } = await chrome.storage.local.get(['parTabs', 'parChunk']);
+    ctx.parTabs = parTabs;
     const range = end - start;
     let planned = 1;
     if (String(parTabs) !== '1') {
@@ -786,25 +1232,48 @@
         planned = parseInt(parTabs, 10) || 1;
       }
     }
-    if (planned > 1 && range >= (Number(parChunk) || 12) * 60 * 1.5) {
+    const parEligible = planned > 1 && range >= (Number(parChunk) || 12) * 60 * 1.5;
+    if (vot && parEligible) {
+      // перевод собирается в finalize одной вкладки — параллельный путь его не умеет;
+      // без этой записи в журнале выглядело так, будто настройка вкладок игнорируется
+      runStep('VOT: параллельный режим отключён, качаю в одной вкладке' +
+        ' (без перевода вкладок было бы ' + planned + ')');
+    }
+    if (!vot && parEligible) {
       t.hide(0);
+      runStep('параллельный режим: вкладок ' + planned + ', кусок ' + parChunk + ' мин');
       return startParallel({
         format, height, start, end, transcode: doTranscode,
         sb: sbSegments, parTabs, parChunk,
       }, info);
     }
 
+    let lastVot = '';
     const onProg = (msg) => {
       if (msg && msg.t === 'ytdl-progress') {
-        t.set((isMp3 ? 'Кодирование MP3… ' : 'Перекодирование в H.264/AAC… ') +
-          Math.round(msg.value * 100) + '%', 0.55 + msg.value * 0.45);
+        // offscreen подписывает, что именно делает ffmpeg: микс перевода и
+        // простая склейка — не «перекодирование», подпись не должна врать
+        t.set((msg.phase || (isMp3 ? 'Кодирование MP3' : 'Перекодирование в H.264/AAC')) +
+          '… ' + Math.round(msg.value * 100) + '%', 0.55 + msg.value * 0.45);
+      }
+      if (msg && msg.t === 'ytdl-run-log') runStep(String(msg.msg || ''));
+      if (msg && msg.t === 'ytdl-vot-status') {
+        t.set('Перевод (VOT): ' + msg.text, 0.55);
+        if (msg.text !== lastVot) { lastVot = msg.text; runStep('VOT: ' + msg.text); }
       }
     };
     chrome.runtime.onMessage.addListener(onProg);
     try {
+      ctx.stage = 'захват потока';
+      runStep('захват потока начат');
+      let lastQ = 0;
       const result = await download({ height, format, start, end }, (d) => {
         t.set('Загрузка сегментов ' + label + '… ' + Math.round(d.progress * 100) + '%', d.progress * 0.5);
+        const q = Math.floor((d.progress || 0) * 4);
+        if (q > lastQ && q < 4) { lastQ = q; runStep('захват ' + q * 25 + '%'); }
       });
+      ctx.stage = 'сборка файла (ffmpeg)';
+      runStep('захват завершён, сборка файла (ffmpeg)');
       t.set((isMp3 ? 'Кодирование MP3…'
         : (transcode ? 'Готовлю перекодирование (может занять дольше ролика)…' : 'Склейка дорожек…')) + sbNote, 0.55);
 
@@ -819,16 +1288,18 @@
         videoMime: result.video && result.video.mime,
         audioMime: result.audio && result.audio.mime,
         filename, transcode: doTranscode, start, end,
-        sb: sbSegments,
+        sb: sbSegments, vot,
       });
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
       t.set('Готово: ' + (res.filename || filename) + sbNote, 1);
       t.hide(4000);
+      runStep('файл сохранён: ' + (res.filename || filename));
+      runEnd('успех');
     } catch (err) {
-      t.set('Ошибка: ' + (err.message || err), 1);
-      t.hide(6000);
-      console.error('[Triangle]', err);
+      t.fail(err, ctx);
+      runStep('ошибка на шаге «' + ctx.stage + '»');
+      runEnd('ошибка', err);
     } finally {
       chrome.runtime.onMessage.removeListener(onProg);
     }
@@ -856,7 +1327,7 @@
       t: 'ytdl-begin', filename: job.filename, format: job.format,
       videoMime: job.videoMime, audioMime: job.audioMime,
       transcode: !!job.transcode, start: job.start, end: job.end,
-      sb: job.sb || [],
+      sb: job.sb || [], vot: job.vot || null,
     });
     if (!beg || !beg.ok) throw new Error('offscreen не принял задание: ' + ((beg && beg.error) || 'нет ответа'));
     const sendTrack = async (name, buf) => {
@@ -884,17 +1355,17 @@
   // videos) — ytdl-ensure now health-checks and recreates it, and the captured
   // buffers are still here in the page, so one clean retry is safe and cheap.
   async function muxViaOffscreen(job) {
-    let lastErr = null;
+    let firstErr = null; // вторая ошибка обычно каскадная — показываем причину
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         return await muxAttempt(job);
       } catch (e) {
-        lastErr = e;
+        if (!firstErr) firstErr = e;
         console.warn('[Triangle] передача в ffmpeg, попытка ' + (attempt + 1) + ':', e);
         await new Promise((r) => setTimeout(r, 1000));
       }
     }
-    throw new Error((lastErr && lastErr.message || lastErr) +
+    throw new Error((firstErr && firstErr.message || firstErr) +
       ' — похоже, ffmpeg упал (не хватило памяти?). Попробуйте меньший фрагмент или 720p.');
   }
 
@@ -916,7 +1387,15 @@
       });
     } catch (e) {}
     if (!resp || !resp.ok) {
-      const t = toast(); t.set('Ошибка запуска параллельной загрузки', 1); t.hide(6000);
+      const err = new Error('не удалось запустить параллельную загрузку: ' +
+        ((resp && resp.error) || 'фоновая страница не ответила'));
+      toast().fail(err, {
+        stage: 'запуск параллельной загрузки', parallel: true,
+        format: opts.format, height: opts.height, start: opts.start, end: opts.end,
+        duration, transcode: opts.transcode, parTabs: opts.parTabs,
+        sbCount: (opts.sb || []).length, videoId: info.videoId,
+      });
+      runEnd('ошибка', err);
       return;
     }
     runParallelUI(resp.taskId, opts, filename);
@@ -1014,15 +1493,33 @@
       setTimeout(() => { try { ui.box.remove(); } catch (e) {} }, 800);
     });
     let missing = 0;
+    let lastState = '';
     while (true) {
       await sleep(1000);
       let st = null;
       try { st = await chrome.runtime.sendMessage({ t: 'ytdl-par-status', taskId }); } catch (e) {}
-      if (!st) { if (++missing > 10) { ui.stat.textContent = 'Ошибка: связь с расширением потеряна'; break; } continue; }
+      if (!st) {
+        if (++missing > 10) {
+          ui.stat.textContent = 'Ошибка: связь с расширением потеряна';
+          runEnd('ошибка', 'связь с расширением потеряна');
+          break;
+        }
+        continue;
+      }
       missing = 0;
-      if (!st.ok) { ui.stat.textContent = 'Ошибка: задача потеряна (service worker перезапустился)'; break; }
+      if (!st.ok) {
+        ui.stat.textContent = 'Ошибка: задача потеряна (service worker перезапустился)';
+        runEnd('ошибка', 'задача потеряна (service worker перезапустился)');
+        break;
+      }
+      if (st.state !== lastState) {
+        lastState = st.state;
+        runStep('параллельно: ' + st.state + (st.error ? ' — ' + st.error : ''),
+          { готово: (st.frags || []).filter((f) => f.st === 'done').length, всего: (st.frags || []).length });
+      }
       renderPanel(ui, st);
-      if (st.state === 'done' || st.state === 'cancel') break;
+      if (st.state === 'done') { runEnd('успех'); break; }
+      if (st.state === 'cancel') { runEnd('отменено'); break; }
       // 'error' and 'stall' keep the panel alive so the user can retry
     }
     setTimeout(() => { try { ui.box.remove(); } catch (e) {} }, 20000);

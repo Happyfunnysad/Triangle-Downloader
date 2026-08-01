@@ -17,6 +17,10 @@ Commands:
 Only paths inside the user's home directory are accepted, and the target is
 matched against the actual peer list — the extension never gets to pass an
 arbitrary string to the shell (there is no shell: subprocess uses argv).
+
+Runs on macOS/Linux and Windows. The two differ mostly in SMB: macOS mounts
+shares under /Volumes and browses via Bonjour, Windows maps them to drive
+letters (or takes \\\\server\\share directly) and has no Bonjour at all.
 """
 
 import json
@@ -25,21 +29,35 @@ import struct
 import subprocess
 import sys
 
+IS_WIN = sys.platform == "win32"
+
 # The CLI ships in different places depending on how Tailscale was installed.
 # The Mac App Store build is sandboxed and does not expose `file cp`, so the
 # standalone app / Homebrew build is required — we report that clearly.
-CANDIDATES = [
-    "/usr/local/bin/tailscale",
-    "/opt/homebrew/bin/tailscale",
-    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-    "/usr/bin/tailscale",
-    "/usr/sbin/tailscale",
-]
+if IS_WIN:
+    CANDIDATES = [
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Tailscale", "tailscale.exe"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Tailscale", "tailscale.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Tailscale", "tailscale.exe"),
+    ]
+else:
+    CANDIDATES = [
+        "/usr/local/bin/tailscale",
+        "/opt/homebrew/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        "/usr/bin/tailscale",
+        "/usr/sbin/tailscale",
+    ]
+
+NO_TAILSCALE = ("не найден CLI tailscale — установите Tailscale с tailscale.com"
+                if IS_WIN else
+                "не найден CLI tailscale — установите Tailscale с tailscale.com "
+                "(версия из App Store не умеет file cp)")
 
 
 def find_tailscale():
     for p in CANDIDATES:
-        if os.path.isfile(p) and os.access(p, os.X_OK):
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     from shutil import which
     return which("tailscale")
@@ -65,8 +83,133 @@ def run(args, timeout=120):
     # stdin MUST be detached: our own stdin is the native-messaging channel, and a
     # child that decides to prompt (smbutil asks for a password without -N) would
     # eat framing bytes and wedge the protocol.
+    #
+    # encoding is explicit on purpose: without it Windows decodes child output
+    # with the ANSI codepage, and `tailscale status --json` (always UTF-8) comes
+    # back mangled — a device named «Телефон» stops matching the name the
+    # extension sends back, and Taildrop reports it as offline.
+    extra = {}
+    if IS_WIN:
+        # otherwise every helper call flashes a console window over the browser
+        extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
-                          stdin=subprocess.DEVNULL)
+                          stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                          **extra)
+
+
+def run_console(args, timeout=120):
+    """Same as run(), but for tools that speak the console codepage (net view).
+
+    `net` predates UTF-8 and prints in the OEM codepage; decoding that as UTF-8
+    turns every non-ASCII share name into replacement characters.
+    """
+    extra = {}
+    if IS_WIN:
+        extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        import ctypes
+        enc = "cp" + str(ctypes.windll.kernel32.GetConsoleOutputCP() or 866)
+    else:
+        enc = "utf-8"
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                          stdin=subprocess.DEVNULL, encoding=enc, errors="replace",
+                          **extra)
+
+
+def _known_downloads():
+    """The real Downloads folder, which is often moved off the system drive.
+
+    Windows keeps it in the known-folder table rather than under the profile, so
+    asking the OS is the only way to learn it; on macOS/Linux it lives in $HOME
+    anyway and the plain path is enough.
+    """
+    if not IS_WIN:
+        return os.path.expanduser("~/Downloads")
+    try:
+        import ctypes
+        from ctypes import wintypes
+        FOLDERID_Downloads = ctypes.create_string_buffer(
+            b"\x90\xe2\x4d\x37\x3f\x12\x65\x45\x91\x64\x39\xc4\x92\x5e\x46\x7b")
+        ptr = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(FOLDERID_Downloads), 0, None, ctypes.byref(ptr)) == 0:
+            path = ptr.value
+            ctypes.windll.ole32.CoTaskMemFree(ptr)
+            return path
+    except Exception:
+        pass
+    return os.path.expanduser("~\\Downloads")
+
+
+def _browser_download_dirs():
+    """Download folders the user picked inside Chromium browsers themselves.
+
+    Chrome's downloads often live on another drive entirely (E:\\Video) without
+    any known-folder redirection. The browser records that choice in each
+    profile's Preferences JSON — the authoritative place to learn it.
+    """
+    if not IS_WIN:
+        return []
+    base = os.environ.get("LOCALAPPDATA", "")
+    if not base:
+        return []
+    out = []
+    for vendor in (r"Google\Chrome", r"Microsoft\Edge",
+                   r"BraveSoftware\Brave-Browser", "Chromium"):
+        userdata = os.path.join(base, vendor, "User Data")
+        try:
+            profiles = os.listdir(userdata)
+        except OSError:
+            continue
+        for prof in profiles:
+            pref = os.path.join(userdata, prof, "Preferences")
+            if not os.path.isfile(pref):
+                continue
+            try:
+                with open(pref, encoding="utf-8") as fh:
+                    d = (json.load(fh).get("download") or {}).get("default_directory")
+            except Exception:
+                continue
+            if d and os.path.isdir(d) and d not in out:
+                out.append(d)
+    return out
+
+
+def allowed_roots():
+    """Folders this helper is willing to read files from.
+
+    The home directory alone is not enough: a browser whose downloads live on
+    another drive (D:\\Downloads) would have every send rejected. Hence also
+    the known Downloads folder and every download directory configured in an
+    installed Chromium browser.
+    """
+    roots = [os.path.expanduser("~")]
+    dl = _known_downloads()
+    if dl:
+        roots.append(dl)
+    roots.extend(_browser_download_dirs())
+    return [os.path.realpath(r) for r in roots if r]
+
+
+def under_home(path):
+    """Resolved path if it sits inside an allowed root, else None.
+
+    Windows paths are case-insensitive, so both sides are normalised before
+    comparing — otherwise C:\\Users\\Name and c:\\users\\name look unrelated.
+    """
+    real = os.path.realpath(os.path.expanduser(path))
+    low = os.path.normcase(real)
+    for root in allowed_roots():
+        r = os.path.normcase(root)
+        if low == r or low.startswith(r.rstrip("\\/") + os.sep):
+            return real
+    return None
+
+
+def outside_error(path):
+    """Rejection message that actually says what was compared."""
+    real = os.path.realpath(os.path.expanduser(path))
+    return ("файл вне разрешённых папок — отклонено. Файл: " + real +
+            "; разрешено: " + ", ".join(allowed_roots()))
 
 
 def cmd_ping(ts):
@@ -74,28 +217,63 @@ def cmd_ping(ts):
     return {"ok": True, "tailscale": ts, "version": (r.stdout or "").strip().splitlines()[:1]}
 
 
+def _pretty_names(ts):
+    """{tailscale IP: human name} from `status --json`.
+
+    `file cp --targets` only prints the machine hostname (s20-fe), while the
+    status output carries the name the owner actually gave the device
+    ("S20 FE пользователя Даниил") — nicer to pick from a list.
+    """
+    names = {}
+    try:
+        r = run([ts, "status", "--json"], timeout=20)
+        if r.returncode != 0:
+            return names
+        st = json.loads(r.stdout)
+        for peer in (st.get("Peer") or {}).values():
+            label = peer.get("HostName") or (peer.get("DNSName") or "").rstrip(".").split(".")[0]
+            for ip in peer.get("TailscaleIPs") or []:
+                names[ip] = label
+    except Exception:
+        pass
+    return names
+
+
 def cmd_devices(ts):
-    r = run([ts, "status", "--json"], timeout=20)
+    """Devices that can actually receive a file.
+
+    Tailscale answers this itself: `file cp --targets` lists exactly the peers
+    Taildrop will accept (same owner, capable platform), one per line as
+    "<ip>\\t<host>[\\toffline; last seen ...]". Deriving the same list from
+    `status --json` by hand means re-implementing rules that belong to
+    Tailscale.
+    """
+    r = run([ts, "file", "cp", "--targets"], timeout=20)
     if r.returncode != 0:
-        return {"ok": False, "error": (r.stderr or "tailscale status failed").strip()}
-    st = json.loads(r.stdout)
-    me = st.get("Self") or {}
-    my_user = me.get("UserID")
+        err = (r.stderr or r.stdout or "").strip()
+        return {"ok": False, "error": err or "tailscale не отдал список устройств"}
+
+    pretty = _pretty_names(ts)
     devices = []
-    for peer in (st.get("Peer") or {}).values():
-        # Taildrop only works between devices owned by the same user
-        if my_user is not None and peer.get("UserID") != my_user:
+    for line in (r.stdout or "").splitlines():
+        parts = line.rstrip().split("\t")
+        if len(parts) < 2 or not parts[0]:
             continue
-        dns = (peer.get("DNSName") or "").rstrip(".")
-        host = peer.get("HostName") or dns.split(".")[0]
+        ip, host = parts[0].strip(), parts[1].strip()
+        note = parts[2].strip() if len(parts) > 2 else ""
         devices.append({
-            "name": host,
-            "host": dns.split(".")[0] or host,
-            "online": bool(peer.get("Online")),
+            "name": pretty.get(ip) or host,
+            "host": host,
+            # The address is what we send to: device names carry apostrophes and
+            # non-ASCII and survive the trip through the browser far less
+            # reliably than 100.x.y.z does.
+            "ip": ip,
+            "online": not note.lower().startswith("offline"),
+            "note": note,
             "self": False,
         })
     devices.sort(key=lambda d: (not d["online"], d["name"].lower()))
-    return {"ok": True, "devices": devices, "self": me.get("HostName")}
+    return {"ok": True, "devices": devices}
 
 
 def cmd_send(ts, msg):
@@ -104,22 +282,27 @@ def cmd_send(ts, msg):
     if not path or not target:
         return {"ok": False, "error": "не указан файл или устройство"}
 
-    real = os.path.realpath(os.path.expanduser(path))
-    home = os.path.realpath(os.path.expanduser("~"))
-    if not real.startswith(home + os.sep):
-        return {"ok": False, "error": "путь вне домашней папки — отклонено"}
+    real = under_home(path)
+    if not real:
+        return {"ok": False, "error": outside_error(path)}
     if not os.path.isfile(real):
         return {"ok": False, "error": "файл не найден: " + real}
 
-    # target must be a real peer, never a free-form string
+    # target must be a real peer, never a free-form string; it may arrive as an
+    # address or as a name (older settings), but we always send to the address
     known = cmd_devices(ts)
     if not known.get("ok"):
         return known
-    names = {d["host"] for d in known["devices"]} | {d["name"] for d in known["devices"]}
-    if target not in names:
-        return {"ok": False, "error": "устройство не найдено в сети: " + target}
+    peer = next((d for d in known["devices"]
+                 if target in (d.get("ip"), d.get("host"), d.get("name")) and target), None)
+    if not peer:
+        return {"ok": False, "error": "устройство не принимает файлы или не в вашей сети: " + target}
+    if not peer.get("online"):
+        return {"ok": False, "error": "устройство не в сети: " + peer["name"] +
+                (" (" + peer["note"] + ")" if peer.get("note") else "")}
+    addr = peer.get("ip") or peer.get("host") or target
 
-    r = run([ts, "file", "cp", real, target + ":"], timeout=3600)
+    r = run([ts, "file", "cp", real, addr + ":"], timeout=3600)
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip() or ("код " + str(r.returncode))
         return {"ok": False, "error": err}
@@ -128,11 +311,60 @@ def cmd_send(ts, msg):
 
 # ---- SMB -------------------------------------------------------------------
 # Mounting requires credentials, which this helper deliberately never handles:
-# mount the share once in Finder (⌘K) and it shows up here as a normal folder
-# under /Volumes. Discovery is Bonjour-only and just tells you what exists.
+# connect the share once in Finder (⌘K) or Explorer, and it shows up here as a
+# normal folder. Discovery just tells you what exists on the network.
+
+def _free_mb(path):
+    try:
+        import shutil
+        return int(shutil.disk_usage(path).free / (1024 * 1024))
+    except Exception:
+        return None
+
+
+def _win_network_drives():
+    """Mapped network drives, read from the OS rather than parsed out of `net use`.
+
+    `net use` prints localised column headers ("OK" vs "ОК"), so its output is
+    not safe to parse; GetDriveType/WNetGetConnection answer the same question
+    in any locale.
+    """
+    import ctypes
+    from ctypes import wintypes
+    DRIVE_REMOTE = 4
+    k32 = ctypes.windll.kernel32
+    mpr = ctypes.windll.mpr
+    out = []
+    mask = k32.GetLogicalDrives()
+    for i in range(26):
+        if not (mask >> i) & 1:
+            continue
+        letter = chr(ord("A") + i) + ":"
+        if k32.GetDriveTypeW(letter + "\\") != DRIVE_REMOTE:
+            continue
+        unc = ""
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        if mpr.WNetGetConnectionW(letter, buf, ctypes.byref(size)) == 0:
+            unc = buf.value
+        out.append({
+            "path": letter + "\\",
+            "name": (unc.rstrip("\\").split("\\")[-1] if unc else letter),
+            "url": unc or letter,
+            "freeMb": _free_mb(letter + "\\"),
+            "writable": os.access(letter + "\\", os.W_OK),
+        })
+    return out
+
 
 def cmd_smb_mounted():
-    """SMB shares already mounted on this Mac."""
+    """SMB shares currently available as folders on this machine."""
+    if IS_WIN:
+        out = _win_network_drives()
+        out.sort(key=lambda d: d["name"].lower())
+        return {"ok": True, "mounted": out,
+                "hint": "можно указать и путь вида \\\\сервер\\шара — подключать диск необязательно"}
+
     r = run(["/sbin/mount"], timeout=10)
     out = []
     for line in (r.stdout or "").splitlines():
@@ -144,17 +376,11 @@ def cmd_smb_mounted():
             mnt = rest.rsplit(" (", 1)[0]
         except ValueError:
             continue
-        free_mb = None
-        try:
-            st = os.statvfs(mnt)
-            free_mb = int(st.f_bavail * st.f_frsize / (1024 * 1024))
-        except Exception:
-            pass
         out.append({
             "path": mnt,
             "name": os.path.basename(mnt.rstrip("/")) or mnt,
             "url": src,
-            "freeMb": free_mb,
+            "freeMb": _free_mb(mnt),
             "writable": os.access(mnt, os.W_OK),
         })
     out.sort(key=lambda d: d["name"].lower())
@@ -179,8 +405,35 @@ def _browse(args, seconds):
     return out or ""
 
 
+def _win_unc_lines(text):
+    """UNC names out of `net view` output — the only locale-proof part of it."""
+    names = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("\\\\"):
+            continue
+        name = line.split()[0].lstrip("\\")
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def cmd_smb_discover(seconds=4):
-    """Bonjour browse for SMB servers on the local network."""
+    """Look for SMB servers on the local network."""
+    if IS_WIN:
+        # Bonjour does not exist here; `net view` relies on the Computer Browser
+        # service, which modern Windows often has disabled — it then hangs until
+        # it gives up. An empty list is the normal outcome, not an error, hence
+        # the short timeout and the hint about typing the path by hand.
+        servers = []
+        try:
+            r = run_console(["net", "view"], timeout=10)
+            servers = [{"name": n, "host": n} for n in _win_unc_lines(r.stdout or "")]
+        except subprocess.TimeoutExpired:
+            pass
+        return {"ok": True, "servers": servers,
+                "hint": "если список пуст, введите путь вручную: \\\\сервер\\шара"}
+
     text = _browse(["/usr/bin/dns-sd", "-B", "_smb._tcp", "local."], seconds)
     names = []
     for line in text.splitlines():
@@ -207,11 +460,35 @@ def cmd_smb_discover(seconds=4):
 
 def cmd_smb_shares(msg):
     """List share names exported by a server (guest browse; may need auth)."""
-    host = (msg.get("host") or "").strip()
+    host = (msg.get("host") or "").strip().strip("\\")
     if not host:
         return {"ok": False, "error": "не указан сервер"}
     if not all(c.isalnum() or c in ".-_" for c in host):
         return {"ok": False, "error": "недопустимое имя сервера"}
+
+    if IS_WIN:
+        try:
+            r = run_console(["net", "view", "\\\\" + host], timeout=15)
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": "сервер не ответил — откройте \\\\" + host + " в проводнике"}
+        if r.returncode != 0:
+            return {"ok": False, "error": (r.stderr or r.stdout or "").strip() or
+                    "не удалось получить список — вероятно, нужен вход; "
+                    "откройте \\\\" + host + " в проводнике"}
+        # Column headers are localised; the share name is always the first token
+        # of the rows between the dashed separator and the trailing status line.
+        shares, started = [], False
+        for line in (r.stdout or "").splitlines():
+            if set(line.strip()) == {"-"}:
+                started = True
+                continue
+            if not started:
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and not line.startswith(" "):
+                shares.append(parts[0])
+        return {"ok": True, "host": host, "shares": shares}
+
     # -N: never prompt for a password. Guest flag spelling differs between macOS
     # releases, so try the guest form first and fall back to plain -N.
     r = None
@@ -230,25 +507,37 @@ def cmd_smb_shares(msg):
     return {"ok": True, "host": host, "shares": shares}
 
 
+def _is_network_target(dst_real):
+    """True if the folder is a network location we are willing to write into."""
+    if IS_WIN and dst_real.startswith("\\\\"):
+        return True  # UNC path — network by definition, no mapping needed
+    known = {m["path"] for m in cmd_smb_mounted()["mounted"]}
+    return any(os.path.normcase(dst_real) == os.path.normcase(k) or
+               os.path.normcase(dst_real).startswith(os.path.normcase(k.rstrip("/\\")) + os.sep)
+               for k in known)
+
+
 def cmd_smb_save(msg):
-    """Copy an already-downloaded file into a mounted SMB folder."""
+    """Copy an already-downloaded file into a network folder."""
     import shutil
     src = msg.get("path") or ""
     dst_dir = msg.get("dir") or ""
     if not src or not dst_dir:
         return {"ok": False, "error": "не указан файл или папка"}
 
-    real = os.path.realpath(os.path.expanduser(src))
-    home = os.path.realpath(os.path.expanduser("~"))
-    if not real.startswith(home + os.sep):
-        return {"ok": False, "error": "путь вне домашней папки — отклонено"}
+    real = under_home(src)
+    if not real:
+        return {"ok": False, "error": outside_error(src)}
     if not os.path.isfile(real):
         return {"ok": False, "error": "файл не найден: " + real}
 
-    dst_real = os.path.realpath(os.path.expanduser(dst_dir))
-    known = {m["path"] for m in cmd_smb_mounted()["mounted"]}
-    if not any(dst_real == k or dst_real.startswith(k.rstrip("/") + os.sep) for k in known):
-        return {"ok": False, "error": "папка не является смонтированной SMB-шарой: " + dst_real}
+    # realpath would resolve a UNC path into something os.path can't compare
+    dst_real = os.path.abspath(os.path.expanduser(dst_dir)) if dst_dir.startswith("\\\\") \
+        else os.path.realpath(os.path.expanduser(dst_dir))
+    if not _is_network_target(dst_real):
+        return {"ok": False, "error": "папка не является сетевой шарой: " + dst_real}
+    if not os.path.isdir(dst_real):
+        return {"ok": False, "error": "папка недоступна: " + dst_real}
     if not os.access(dst_real, os.W_OK):
         return {"ok": False, "error": "нет прав на запись: " + dst_real}
 
@@ -269,6 +558,7 @@ def cmd_ftp_put(msg):
     """Upload a downloaded file over FTP via curl. Credentials go through a
     0600 temp config file, never through argv (argv is visible in `ps`)."""
     import tempfile
+    from shutil import which
     src = msg.get("path") or ""
     host = (msg.get("host") or "").strip()
     if not src or not host:
@@ -276,12 +566,15 @@ def cmd_ftp_put(msg):
     if not all(c.isalnum() or c in ".-_" for c in host):
         return {"ok": False, "error": "недопустимое имя сервера"}
 
-    real = os.path.realpath(os.path.expanduser(src))
-    home = os.path.realpath(os.path.expanduser("~"))
-    if not real.startswith(home + os.sep):
-        return {"ok": False, "error": "путь вне домашней папки — отклонено"}
+    real = under_home(src)
+    if not real:
+        return {"ok": False, "error": outside_error(src)}
     if not os.path.isfile(real):
         return {"ok": False, "error": "файл не найден: " + real}
+
+    curl = which("curl")
+    if not curl:
+        return {"ok": False, "error": "не найден curl (в Windows входит в состав системы с 2018 года)"}
 
     port = int(msg.get("port") or 21)
     dirpath = "/".join(p for p in str(msg.get("dir") or "").split("/") if p and p != "..")
@@ -295,7 +588,7 @@ def cmd_ftp_put(msg):
     try:
         os.write(fd, ('user = "%s:%s"\n' % (q(user), q(password))).encode())
         os.close(fd)
-        r = run(["curl", "-sS", "--connect-timeout", "15", "--ftp-create-dirs",
+        r = run([curl, "-sS", "--connect-timeout", "15", "--ftp-create-dirs",
                  "--config", cfgfile, "-T", real, url], timeout=3600)
     finally:
         try: os.unlink(cfgfile)
@@ -306,6 +599,13 @@ def cmd_ftp_put(msg):
 
 
 def main():
+    if IS_WIN:
+        # Windows would translate \n into \r\n on the way out and corrupt the
+        # length-prefixed framing.
+        import msvcrt
+        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+
     ts = find_tailscale()
     while True:
         try:
@@ -330,9 +630,7 @@ def main():
                 write_message(cmd_ftp_put(msg)); continue
 
             if not ts:
-                write_message({"ok": False, "error":
-                               "не найден CLI tailscale — установите Tailscale с tailscale.com "
-                               "(версия из App Store не умеет file cp)"})
+                write_message({"ok": False, "error": NO_TAILSCALE})
                 continue
             if cmd == "ping":
                 write_message(cmd_ping(ts))
@@ -343,7 +641,7 @@ def main():
             else:
                 write_message({"ok": False, "error": "неизвестная команда: " + str(cmd)})
         except subprocess.TimeoutExpired:
-            write_message({"ok": False, "error": "tailscale не ответил вовремя"})
+            write_message({"ok": False, "error": "внешняя команда не ответила вовремя"})
         except Exception as e:
             write_message({"ok": False, "error": str(e)})
 

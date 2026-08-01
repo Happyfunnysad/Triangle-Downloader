@@ -4,7 +4,8 @@
 
 A Chrome extension (Manifest V3) that adds a ▽ button right into the YouTube player and lets
 you download the current video, audio, and subtitles — by capturing the player's own stream.
-No `yt-dlp`, no third‑party sites or servers: everything runs locally in your browser.
+No `yt-dlp`, no third‑party sites: everything runs locally in your browser. The only outbound
+requests come from features you turn on yourself: SponsorBlock and voice-over translation.
 
 ![Triangle Downloader menu screenshot](docs/screenshot.png)
 
@@ -27,6 +28,16 @@ No `yt-dlp`, no third‑party sites or servers: everything runs locally in your 
   video won't start on its own.
 - **SponsorBlock** — optionally removes sponsor segments, self-promotion, and interaction
   reminders; lookups use k-anonymity and never send the complete video ID.
+- **Voice-over translation (VOT)** — Yandex's voice-over dub baked into the downloaded file.
+  Off by default; once enabled, the video link is sent to Yandex, which prepares the track
+  (usually a couple of minutes — the request goes out immediately and runs in parallel with
+  the capture). Three modes: "over" (original ducked + translation), "replace"
+  (translation only) and "track" (both audio streams in mp4, language-tagged). Target
+  languages: Russian, English, Kazakh. "Lively voice" uses Yandex's neural voices, requires
+  signing in (Yandex hosts the login window; the extension never sees your password) and
+  only works when translating into Russian. If Yandex answers `402` — how it greets requests
+  from outside the CIS — settings offer a third-party relay, which routes the video link
+  through someone else's server. If the translation fails, the file is still saved without it.
 
 ## ⚠️ Requirements
 
@@ -89,6 +100,15 @@ extension hooks in where the data has already been decrypted and split into trac
 [ffmpeg.wasm](https://github.com/ffmpegwasm/ffmpeg.wasm): the npm packages
 `@ffmpeg/ffmpeg@0.12.10` and `@ffmpeg/core@0.12.6` (single‑threaded build, no cross‑origin
 isolation required).
+
+The voice-over translation client in `extension/vot.js` uses protocol details from
+[VOT - Voice Over Translation](https://github.com/ilyhalight/voice-over-translation)
+(MIT).
+
+Sponsor segment lookups are provided by [SponsorBlock](https://sponsor.ajay.app/),
+whose data is licensed under CC BY-NC-SA 4.0.
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party notices.
 
 ## License
 

@@ -2,10 +2,25 @@
 node_modules/
 package.json
 package-lock.json
+*.crx
+*.pem
+dist/
+
+# Создаётся браузером при загрузке распакованного расширения,
+# а также установщиком помощника
+extension/_metadata/
+native/triangle_taildrop.bat
+native/com.triangle.taildrop.json
+native/__pycache__/
+__pycache__/
 
 # Editor / IDE
 .claude/
+.codegraph/
 .claude-ide/
+.lore/
+.loreignore
+.mcp.json
 .vscode/
 .idea/
 
@@ -13,3 +28,9 @@ package-lock.json
 .DS_Store
 Thumbs.db
 *~
+
+# teamlore
+.claude/skills/teamlore/.needs-distill
+
+# Local reference dumps
+\[VOT\] - Voice Over Translation-*.txt
