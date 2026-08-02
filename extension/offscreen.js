@@ -83,6 +83,8 @@ function extFor(mime) {
   return 'bin';
 }
 async function rm(inst, name) { try { await inst.deleteFile(name); } catch (e) {} }
+const mp4CopyInput = (name) => /\.(mp4|m4a)$/i.test(name || '');
+const webmCopyInput = (name) => /\.webm$/i.test(name || '');
 
 // Главы и субтитры вшиваются ОТДЕЛЬНЫМ проходом с копированием потоков. Так они
 // не вмешиваются в раскладку входов основной сборки (видео, аудио, дорожка
@@ -169,8 +171,9 @@ async function copyCutConcat(inst, vName, aName, keep, sV, sA, vot) {
   const variants = [
     { ext: 'mp4', type: 'video/mp4', extra: ['-strict', '-2'], concatExtra: ['-movflags', '+faststart'] },
     { ext: 'webm', type: 'video/webm', extra: [], concatExtra: [] },
-  ];
-  if (vot) variants.length = 1;
+  ].filter((v) => v.ext === 'mp4'
+    ? mp4CopyInput(vName) && mp4CopyInput(aName)
+    : !vot && webmCopyInput(vName) && webmCopyInput(aName));
   const third = (vot && vot.third) || null;
   ffPhase = 'Вырезка вставок и склейка';
   let lastErr = '';
@@ -409,12 +412,16 @@ async function finalize(acc) {
       const votCodec = votTrack
         ? ['-c:a:1', 'aac', '-b:a:1', '160k',
            '-metadata:s:a:1', 'language=' + votLang3, '-disposition:a:0', 'default'] : [];
-      runs.push({
-        out: 'out.mp4', type: 'video/mp4', ext: '.mp4', phase: 'Склейка дорожек (без перекодирования)',
-        args: [...inV, ...inA, ...inT, '-map', '0:v:0', '-map', '1:a:0', ...votMaps, ...limit,
-          '-c', 'copy', ...votCodec, '-strict', '-2', '-movflags', '+faststart', 'out.mp4'],
-      });
-      if (!votApplied) { // AAC-микс и вторая дорожка несовместимы с webm
+      // Stream-copy works only when the streams match the container. Trying
+      // WebM/VP9/Opus into MP4 can abort ffmpeg.wasm before the WebM fallback.
+      if (mp4CopyInput(vName) && mp4CopyInput(aName)) {
+        runs.push({
+          out: 'out.mp4', type: 'video/mp4', ext: '.mp4', phase: 'Склейка дорожек (без перекодирования)',
+          args: [...inV, ...inA, ...inT, '-map', '0:v:0', '-map', '1:a:0', ...votMaps, ...limit,
+            '-c', 'copy', ...votCodec, '-strict', '-2', '-movflags', '+faststart', 'out.mp4'],
+        });
+      }
+      if (!votApplied && webmCopyInput(vName) && webmCopyInput(aName)) { // AAC-микс и вторая дорожка несовместимы с webm
         runs.push({
           out: 'out.webm', type: 'video/webm', ext: '.webm', phase: 'Склейка дорожек (без перекодирования)',
           args: [...inV, ...inA, '-map', '0:v:0', '-map', '1:a:0', ...limit, '-c', 'copy', 'out.webm'],
@@ -687,12 +694,8 @@ async function parMerge(msg) {
     : msg.transcode
       ? [{ out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
            args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-movflags', '+faststart', 'out.mp4'] }]
-      : [
-          { out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
-            args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-strict', '-2', '-movflags', '+faststart', 'out.mp4'] },
-          { out: 'out.webm', type: 'video/webm', ext: '.webm',
-            args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'out.webm'] },
-        ];
+      : [{ out: 'out.webm', type: 'video/webm', ext: '.webm',
+           args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'out.webm'] }];
 
   let data = null, chosen = null, lastErr = '';
   for (const run of attempts) {

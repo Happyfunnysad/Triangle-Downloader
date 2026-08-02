@@ -237,12 +237,23 @@ function testDestReadinessIsShared() {
   assert.ok(src.includes("set('ftp', destReady('ftp')"), 'FTP-карточка проверяется не тем же правилом, что пилюля');
 }
 
+function testWebmCopyDoesNotTryMp4First() {
+  const src = fs.readFileSync(path.join(__dirname, 'extension', 'offscreen.js'), 'utf8');
+  assert.ok(src.includes('mp4CopyInput(vName) && mp4CopyInput(aName)'),
+    'MP4 copy не проверяет совместимость входных потоков');
+  assert.ok(src.includes('webmCopyInput(vName) && webmCopyInput(aName)'),
+    'WebM copy не проверяет совместимость входных потоков');
+  assert.ok(src.includes(": [{ out: 'out.webm', type: 'video/webm', ext: '.webm',"),
+    'параллельная склейка без перекодирования снова может попробовать MP4 перед WebM');
+}
+
 (async () => {
   await testBackground();
   await testOffscreen();
   testSubsAndChapters();
   testParallelKeepsMediaExtras();
   testDestReadinessIsShared();
+  testWebmCopyDoesNotTryMp4First();
   console.log('все проверки прошли');
   process.exit(0); // код расширения оставляет свои долгие таймеры — они тут ни к чему
 })().catch((e) => { console.error(e); process.exit(1); });
