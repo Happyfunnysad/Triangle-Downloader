@@ -99,6 +99,14 @@
     svg.appendChild(svgEl('circle', { cx: '10', cy: '17', r: '2.4', stroke: 'currentColor', 'stroke-width': '1.7' }));
     return svg;
   }
+  function listSvg() {
+    const svg = svgEl('svg', { viewBox: '0 0 24 24', fill: 'none' });
+    svg.appendChild(svgEl('path', {
+      d: 'M4 6h16M4 12h16M4 18h10',
+      stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round',
+    }));
+    return svg;
+  }
 
   // ---- button --------------------------------------------------------------
   function makeButton() {
@@ -119,8 +127,19 @@
   }
 
   let menuEl = null;
-  function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; document.removeEventListener('click', onDocClick, true); } }
-  function onDocClick(e) { if (menuEl && !menuEl.contains(e.target) && e.target.id !== BTN_ID) closeMenu(); }
+  let menuQueueTimer = null; // счётчик очереди в шапке, пока меню открыто
+  function closeMenu() {
+    if (!menuEl) return;
+    menuEl.remove(); menuEl = null;
+    clearInterval(menuQueueTimer); menuQueueTimer = null;
+    queueCount.onChange = null; // счётчик в шапке ушёл вместе с меню
+    document.removeEventListener('click', onDocClick, true);
+  }
+  function onDocClick(e) {
+    if (!menuEl || menuEl.contains(e.target) || e.target.id === BTN_ID) return;
+    if (queueBox && queueBox.box.contains(e.target)) return; // панель очереди — не «мимо меню»
+    closeMenu();
+  }
 
   // Меню пересоздаётся при каждом открытии, поэтому слушатель хранилища живёт
   // здесь и лишь вызывает актуальный обработчик открытого меню.
@@ -154,6 +173,28 @@
     row.appendChild(el('div', 'ytdl-hint', hint));
     return row;
   }
+  // то же самое, но с несколькими одновременно выбранными вариантами
+  function multiRow(label, hint, options, current, onPick) {
+    const row = el('div', 'ytdl-row');
+    const top = el('div', 'ytdl-row-top');
+    top.appendChild(el('span', null, label));
+    const wrap = el('span', 'ytdl-opts');
+    const set = new Set(current);
+    for (const o of options) {
+      const b = el('button', set.has(o.key) ? 'sel' : null, o.label);
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (set.has(o.key)) set.delete(o.key); else set.add(o.key);
+        b.classList.toggle('sel', set.has(o.key));
+        onPick([...set]);
+      });
+      wrap.appendChild(b);
+    }
+    top.appendChild(wrap);
+    row.appendChild(top);
+    row.appendChild(el('div', 'ytdl-hint', hint));
+    return row;
+  }
 
   // After the extension is reloaded, content scripts already running in open tabs
   // are orphaned: every chrome.* call throws "Extension context invalidated".
@@ -176,7 +217,7 @@
       await openMenu();
     } catch (err) {
       console.error('[Triangle] не удалось открыть меню:', err);
-      if (menuEl) { menuEl.remove(); menuEl = null; }
+      closeMenu(); // снимает и счётчик очереди, и его таймер
       const t = toast();
       t.set(contextAlive() ? 'Ошибка меню: ' + ((err && err.message) || err)
                            : 'Расширение обновилось — обновите страницу (F5)', 1);
@@ -211,15 +252,20 @@
 
     let store = {};
     try {
-      store = await chrome.storage.local.get(['transcode', 'sbCut', 'parTabs', 'parChunk',
+      store = await chrome.storage.local.get(['transcode', 'sbCut', 'sbCats', 'parTabs', 'parChunk',
+        'audioRaw', 'capMin',
         'votOn', 'votMode', 'votLang', 'votSrcLang', 'votLively', 'votAuth',
         'votProxy', 'votProxyCfg']);
     } catch (e) { /* fall back to defaults rather than losing the menu */ }
     const cfg = {
       transcode: !!store.transcode,
       sbCut: store.sbCut !== false,
+      sbCats: Array.isArray(store.sbCats) && store.sbCats.length
+        ? store.sbCats : ['sponsor', 'selfpromo', 'interaction'],
       parTabs: String(store.parTabs == null ? 'auto' : store.parTabs),
       parChunk: String(Number(store.parChunk) || 12),
+      audioRaw: !!store.audioRaw,
+      capMin: String(Number(store.capMin) || 20),
       votOn: !!store.votOn,
       votMode: store.votMode || 'mix',
       votLang: store.votLang || 'ru',
@@ -248,6 +294,22 @@
     mark.appendChild(triangleSvg('#ff4e45'));
     head.appendChild(mark);
     head.appendChild(el('b', null, 'Triangle'));
+    // очередь: кнопка со счётчиком идущих заданий (в том числе из других вкладок)
+    const qBtn = el('button', 'ytdl-gear ytdl-qbtn');
+    qBtn.title = 'Очередь загрузок';
+    qBtn.appendChild(listSvg());
+    const qBadge = el('i', 'ytdl-qbadge');
+    qBtn.appendChild(qBadge);
+    qBtn.addEventListener('click', (ev) => { ev.stopPropagation(); queueToggle(); });
+    head.appendChild(qBtn);
+    queueCount.onChange = (n) => {
+      qBadge.textContent = n ? String(n) : '';
+      qBadge.style.display = n ? '' : 'none';
+    };
+    queueCount.onChange(queueCount.active);
+    queueRefresh();
+    clearInterval(menuQueueTimer);
+    menuQueueTimer = setInterval(queueRefresh, 2000);
     const gear = el('button', 'ytdl-gear');
     gear.title = 'Настройки';
     gear.appendChild(gearSvg());
@@ -423,6 +485,24 @@
       [{ key: 'cut', label: 'Вырезать' }, { key: 'keep', label: 'Оставить' }],
       cfg.sbCut ? 'cut' : 'keep',
       (k) => { cfg.sbCut = k === 'cut'; chrome.storage.local.set({ sbCut: cfg.sbCut }); renderChips(); drawSponsors(); }));
+    settings.appendChild(multiRow('Что вырезать',
+      'категории SponsorBlock; работает, когда вырезание включено',
+      [{ key: 'sponsor', label: 'Реклама' }, { key: 'selfpromo', label: 'Самореклама' },
+       { key: 'interaction', label: 'Подписка' }, { key: 'intro', label: 'Заставка' },
+       { key: 'outro', label: 'Финал' }, { key: 'preview', label: 'Анонс' },
+       { key: 'music_offtopic', label: 'Не музыка' }, { key: 'filler', label: 'Отступления' }],
+      cfg.sbCats,
+      (v) => { cfg.sbCats = v; chrome.storage.local.set({ sbCats: v }).then(drawSponsors); }));
+    settings.appendChild(settingRow('Звук в MP3',
+      'оригинал копирует дорожку YouTube как есть — быстрее и без потери качества (файл .opus или .m4a); с вырезками SponsorBlock всё равно нужен MP3',
+      [{ key: 'mp3', label: 'MP3' }, { key: 'raw', label: 'Оригинал' }],
+      cfg.audioRaw ? 'raw' : 'mp3',
+      (k) => { cfg.audioRaw = k === 'raw'; chrome.storage.local.set({ audioRaw: cfg.audioRaw }); }));
+    settings.appendChild(settingRow('Потолок захвата',
+      'сколько минут ждать подкачку, прежде чем сдаться; на медленном канале длинному диапазону нужно больше',
+      [{ key: '20', label: '20' }, { key: '40', label: '40' }, { key: '60', label: '60' }, { key: '120', label: '120' }],
+      cfg.capMin,
+      (k) => { cfg.capMin = k; chrome.storage.local.set({ capMin: Number(k) }); }));
     settings.appendChild(settingRow('Вкладки',
       'параллельная загрузка длинных видео фоновыми вкладками',
       [{ key: 'auto', label: 'Авто' }, { key: '1', label: '1' }, { key: '2', label: '2' }, { key: '3', label: '3' }, { key: '4', label: '4' }],
@@ -946,6 +1026,196 @@
     };
   }
 
+  // ---- очередь загрузок ----------------------------------------------------
+  // Сам список заданий держит service worker (см. background.js): качать можно
+  // из нескольких вкладок сразу, и панель должна показывать всё, а не только
+  // «своё». Здесь только клиент — вкладка досылает свои шаги и рисует панель.
+  const Q_STATE = {
+    run: 'идёт', pause: 'пауза', merge: 'склейка', stall: 'нужен повтор',
+    done: 'готово', error: 'ошибка', cancel: 'отменено',
+  };
+  const qActive = (it) => !it.finishedAt;
+
+  function qSend(m) {
+    try { return chrome.runtime.sendMessage(m).catch(() => null); }
+    catch (e) { return Promise.resolve(null); }
+  }
+
+  // Возвращает «ручку» задания: .upd(текст, доля) и .end(состояние, детали).
+  // Если воркер не ответил, ручка молча ничего не делает — очередь не тот повод,
+  // из-за которого стоит валить саму загрузку.
+  async function queueAdd(fields) {
+    const r = await qSend(Object.assign({ t: 'ytdl-q-add' }, fields));
+    const id = r && r.ok ? r.id : null;
+    let lastNote = null, lastPct = -1;
+    return {
+      id,
+      upd(note, progress) {
+        if (!id) return;
+        // шаг в 1% — иначе прогресс захвата шлёт по сообщению каждые 350 мс
+        const pct = progress == null ? lastPct : Math.round(progress * 100) / 100;
+        if (note === lastNote && pct === lastPct) return;
+        lastNote = note; lastPct = pct;
+        qSend({ t: 'ytdl-q-upd', id, note, progress: pct });
+        queueRefresh();
+      },
+      end(state, extra) {
+        if (!id) return;
+        qSend(Object.assign({ t: 'ytdl-q-end', id, state }, extra || {}));
+        queueRefresh();
+      },
+    };
+  }
+
+  let queueBox = null;    // панель, пока открыта
+  let queueTimer = null;  // опрос списка раз в секунду
+  const queueCount = { active: 0, onChange: null }; // для счётчика в шапке меню
+
+  function queueToggle() { if (queueBox) queueClose(); else queueOpen(); }
+
+  function queueClose() {
+    clearInterval(queueTimer); queueTimer = null;
+    if (queueBox) { queueBox.box.remove(); queueBox = null; }
+  }
+
+  function queueOpen() {
+    if (queueBox) { queueRefresh(); return; }
+    const box = el('div'); box.id = 'ytdl-queue';
+    box.addEventListener('click', (ev) => ev.stopPropagation());
+
+    const head = el('div', 'ytdl-q-head');
+    const mark = el('span'); mark.style.width = '13px'; mark.style.height = '13px';
+    mark.appendChild(triangleSvg('#ff4e45'));
+    head.appendChild(mark);
+    const title = el('span', 'ytdl-q-title', 'Очередь загрузок');
+    head.appendChild(title);
+    const clear = el('button', 'ytdl-q-clear', 'очистить');
+    clear.title = 'убрать завершённые';
+    clear.addEventListener('click', async () => {
+      const r = await qSend({ t: 'ytdl-q-ctl', cmd: 'clear' });
+      if (r && r.ok) renderQueue(r.items);
+    });
+    head.appendChild(clear);
+    const close = el('button', 'ytdl-q-close', '✕');
+    close.title = 'Скрыть';
+    close.addEventListener('click', queueClose);
+    head.appendChild(close);
+    box.appendChild(head);
+
+    const list = el('div', 'ytdl-q-list');
+    box.appendChild(list);
+    document.body.appendChild(box);
+
+    queueBox = { box, list, title, clear };
+    queueRefresh();
+    queueTimer = setInterval(queueRefresh, 1000);
+  }
+
+  // Один запрос обслуживает и панель, и счётчик в шапке меню — поэтому он
+  // выполняется даже с закрытой панелью, когда меню открыто.
+  async function queueRefresh() {
+    if (!queueBox && !queueCount.onChange) return;
+    const r = await qSend({ t: 'ytdl-q-list' });
+    if (!r || !r.ok) return;
+    queueCount.active = r.items.filter(qActive).length;
+    if (queueCount.onChange) queueCount.onChange(queueCount.active);
+    if (queueBox) renderQueue(r.items);
+  }
+
+  // Панель открывается сама только когда очередь действительно очередь —
+  // то есть рядом с новым заданием уже идёт другое. Одиночная загрузка и без
+  // того видна в тосте, и лишнее окно поверх плеера ей ни к чему.
+  async function queueAutoOpen() {
+    if (queueBox) return;
+    const r = await qSend({ t: 'ytdl-q-list' });
+    if (r && r.ok && r.items.filter(qActive).length > 1) queueOpen();
+  }
+
+  function queueRow(it) {
+    const row = el('div', 'ytdl-q-row' + (qActive(it) ? '' : ' fin'));
+
+    const top = el('div', 'ytdl-q-top');
+    if (it.label) top.appendChild(el('i', 'ytdl-q-tag', it.label));
+    const name = el('span', 'ytdl-q-name', it.name || 'видео');
+    name.title = it.filename || it.name || '';
+    top.appendChild(name);
+    const st = el('span', 'ytdl-q-st ytdl-q-st-' + it.state, Q_STATE[it.state] || it.state);
+    top.appendChild(st);
+
+    // Повтор поднимает загрузку целиком в воркере: вкладку с видео задание
+    // откроет себе само, поэтому кнопка работает и для давно закрытого ролика.
+    if (it.retryable) {
+      const re = el('button', 'ytdl-q-re', '↻');
+      re.title = 'Повторить загрузку';
+      re.addEventListener('click', async () => {
+        re.disabled = true;
+        const r = await qSend({ t: 'ytdl-q-ctl', cmd: 'retry', id: it.id });
+        if (r && r.items) renderQueue(r.items);
+      });
+      top.appendChild(re);
+    }
+
+    if (it.state === 'done' && it.filename) {
+      const fold = el('button', 'ytdl-q-re', '📂');
+      fold.title = 'Показать в папке';
+      fold.addEventListener('click', () => qSend({ t: 'ytdl-q-show', filename: it.filename }));
+      top.appendChild(fold);
+    }
+
+    // отменить можно только параллельное задание — однотабный захват идёт внутри
+    // страницы, прервать его на полпути нечем; у завершённых крестик убирает строку
+    const act = el('button', 'ytdl-q-x', '✕');
+    if (it.cancelable) {
+      act.title = 'Отменить';
+      act.addEventListener('click', async () => {
+        const r = await qSend({ t: 'ytdl-q-ctl', cmd: 'cancel', id: it.id });
+        if (r && r.ok) renderQueue(r.items);
+      });
+    } else if (!qActive(it)) {
+      act.title = 'Убрать из списка';
+      act.addEventListener('click', async () => {
+        const r = await qSend({ t: 'ytdl-q-ctl', cmd: 'remove', id: it.id });
+        if (r && r.ok) renderQueue(r.items);
+      });
+    } else {
+      act.style.visibility = 'hidden';
+    }
+    top.appendChild(act);
+    row.appendChild(top);
+
+    const bar = el('div', 'ytdl-q-bar');
+    const fill = el('i');
+    fill.style.width = Math.round(it.progress * 100) + '%';
+    if (it.state === 'done') fill.style.background = '#3dba54';
+    else if (it.state === 'error') fill.style.background = '#ff4e45';
+    else if (it.state === 'cancel' || it.state === 'pause') fill.style.background = '#6f7378';
+    bar.appendChild(fill);
+    row.appendChild(bar);
+
+    const note = it.state === 'error' ? (it.error || 'ошибка')
+      : it.state === 'done' ? (it.filename || 'файл сохранён')
+      : it.note || '';
+    const foot = el('div', 'ytdl-q-note',
+      (note ? note + ' · ' : '') + Math.round(it.progress * 100) + '%' +
+      (it.dest && it.dest !== 'local' ? ' · → ' + it.dest : ''));
+    row.appendChild(foot);
+    if (it.warn) row.appendChild(el('div', 'ytdl-q-warn', it.warn));
+    return row;
+  }
+
+  function renderQueue(items) {
+    if (!queueBox) return;
+    const { list, title, clear } = queueBox;
+    while (list.firstChild) list.removeChild(list.firstChild);
+    // свежие сверху: пока что-то идёт, смотрят именно на них
+    const sorted = items.slice().sort((a, b) => (qActive(b) - qActive(a)) || (b.startedAt - a.startedAt));
+    for (const it of sorted) list.appendChild(queueRow(it));
+    if (!sorted.length) list.appendChild(el('div', 'ytdl-q-empty', 'Пока пусто'));
+    const active = items.filter(qActive).length;
+    title.textContent = active ? 'Очередь · ' + active + ' в работе' : 'Очередь загрузок';
+    clear.style.display = items.some((it) => !qActive(it)) ? '' : 'none';
+  }
+
   // Всё, что нужно для разбора, кроме секретов: токен Яндекса и пароли получателей
   // сюда не попадают.
   function buildReport(err, ctx) {
@@ -1120,7 +1390,11 @@
   async function downloadSubtitles(info) {
     const t = toast();
     t.set('Открываю расшифровку…', 0.3);
+    const q = await queueAdd({ name: info.title || 'видео', label: '.txt',
+      videoId: info.videoId, note: 'расшифровка' });
+    queueAutoOpen();
     try {
+      q.upd('открываю расшифровку', 0.3);
       const res = await callHook('subtitles');
       if (!res || !res.ok) throw new Error((res && res.error) || 'нет субтитров');
       const filename = safeName(info.title) + ' [' + (res.lang || 'txt') + '].txt';
@@ -1130,8 +1404,10 @@
       if (!save || !save.ok) throw new Error((save && save.error) || 'не удалось сохранить');
       t.set('Готово: ' + filename, 1);
       t.hide(4000);
+      q.end('done', { filename });
     } catch (err) {
       t.fail(err, { stage: 'субтитры', format: 'txt', videoId: info.videoId, duration: info.duration });
+      q.end('error', { error: String((err && err.message) || err) });
     }
   }
 
@@ -1154,10 +1430,15 @@
     const duration = Math.floor(info.duration || 0);
     const isMp3 = format === 'mp3';
     const label = isMp3 ? 'MP3' : height + 'p';
+    // Ключ этой загрузки. Качать можно из нескольких вкладок сразу, а offscreen и
+    // воркер — общие: без ключа их чанки складывались в один буфер, а прогресс,
+    // журнал и статус перевода уходили в ту вкладку, что начала последней.
+    const jobId = 'j' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const t = toast();
     t.set('Готовлю ' + label + ' — загрузка сегментов…', 0.02);
 
-    const { transcode = false, sbCut = true } = await chrome.storage.local.get(['transcode', 'sbCut']);
+    const { transcode = false, sbCut = true, audioRaw = false, capMin = 20 } =
+      await chrome.storage.local.get(['transcode', 'sbCut', 'audioRaw', 'capMin']);
     const doTranscode = isMp3 ? true : !!transcode; // mp3 always encodes
 
     // ---- VOT: запустить перевод СРАЗУ — он готовится на сервере Яндекса
@@ -1177,7 +1458,7 @@
     await runStart({ type: 'video', format, height, start, end, duration, videoId: info.videoId,
       dest: ctx.dest });
     const votLang = vs.votLang || 'ru';
-    const vot = vs.votOn ? {
+    let vot = vs.votOn ? {
       videoId: info.videoId,
       mode: vs.votMode || 'mix',
       lang: votLang,
@@ -1186,22 +1467,45 @@
       // эти же поля образуют ключ задания, поэтому значение должно быть честным
       lively: !!vs.votLively && authOk && votLang === 'ru',
     } : null;
+    if (vot && vot.srcLang !== 'auto') {
+      // Если пользователь явно выбрал тот же исходный язык, что и целевой,
+      // Яндекс обычно зависает в WAITING. Авто-язык с YouTube не используем для
+      // пропуска: captionTracks иногда отражают субтитры/локализацию, а не
+      // реальную озвучку, и тогда VOT вообще не стартует.
+      if (vot.srcLang === vot.lang) {
+        runStep('VOT: видео уже на языке "' + vot.lang + '" — перевод пропущен');
+        vot = null;
+      }
+    }
     if (vot) {
       t.set('Перевод (VOT): отправляю запрос…', 0.02);
-      toOffscreen({
-        t: 'ytdl-vot-start',
+      // Спецификация целиком (а не только ключ задания) уходит и в vot-start, и
+      // потом в ytdl-begin: если offscreen пересоздадут посреди передачи, по ней
+      // перевод запустится заново, а не пропадёт молча.
+      const votSpec = {
+        job: jobId,
         videoId: vot.videoId,
         url: 'https://youtu.be/' + info.videoId,
         duration: info.duration || 0,
         title: info.title || '',
+        mode: vot.mode,
         lang: vot.lang,
         srcLang: vot.srcLang,
         lively: vot.lively,
         token: authOk ? auth.token : '',
         proxy: vs.votProxy ? ((vs.votProxyCfg && vs.votProxyCfg.host) || 'vot-worker.eu.cc') : '',
-      }).catch(() => {}); // не фатально: finalize сохранит файл без перевода
-      runStep('VOT: запрос перевода отправлен',
-        { lang: vot.lang, srcLang: vot.srcLang, mode: vot.mode, lively: vot.lively, proxy: !!vs.votProxy });
+      };
+      try {
+        const vr = await toOffscreen(Object.assign({ t: 'ytdl-vot-start' }, votSpec));
+        if (!vr || !vr.ok) throw new Error((vr && vr.error) || 'offscreen не принял задачу');
+        vot = votSpec;
+        runStep('VOT: запрос перевода отправлен',
+          { lang: vot.lang, srcLang: vot.srcLang, mode: vot.mode, lively: vot.lively, proxy: !!vs.votProxy });
+      } catch (e) {
+        const msg = String((e && e.message) || e);
+        runStep('VOT: не удалось запустить перевод — сохраню без перевода', msg);
+        vot = null;
+      }
     }
     ctx.vot = vot;
     ctx.authOk = authOk;
@@ -1244,21 +1548,45 @@
       runStep('параллельный режим: вкладок ' + planned + ', кусок ' + parChunk + ' мин');
       return startParallel({
         format, height, start, end, transcode: doTranscode,
-        sb: sbSegments, parTabs, parChunk,
+        sb: sbSegments, parTabs, parChunk, label, dest: ctx.dest,
       }, info);
     }
 
+    const ext = isMp3 ? '.mp3' : '.mp4';
+    const mkName = (e) => safeName(info.title) + (isMp3 ? '' : ' [' + height + 'p]') +
+      fragSuffix(start, e, duration) + ext;
+    let filename = mkName(end); // при неполном захвате пересчитаем по факту
+
+    // Запись в очереди заводим уже после развилки: у параллельного пути она своя,
+    // её создаёт service worker вместе с заданием (см. ytdl-par-start). Вместе с
+    // записью уходит слепок задания — по нему воркер сможет повторить загрузку,
+    // даже когда эта вкладка давно закрыта.
+    const q = await queueAdd({
+      name: info.title || 'видео', label, videoId: info.videoId,
+      dest: ctx.dest, note: 'подготовка',
+      spec: {
+        url: location.origin + '/watch?v=' + encodeURIComponent(info.videoId),
+        videoId: info.videoId, height, format, transcode: doTranscode,
+        start, end, sb: sbSegments, filename,
+        tabsMode: String(parTabs), chunkMin: Number(parChunk) || 12, vot: !!vot,
+      },
+    });
+    queueAutoOpen();
+
     let lastVot = '';
     const onProg = (msg) => {
+      if (!msg || (msg.job && msg.job !== jobId)) return; // чужая загрузка
       if (msg && msg.t === 'ytdl-progress') {
         // offscreen подписывает, что именно делает ffmpeg: микс перевода и
         // простая склейка — не «перекодирование», подпись не должна врать
-        t.set((msg.phase || (isMp3 ? 'Кодирование MP3' : 'Перекодирование в H.264/AAC')) +
-          '… ' + Math.round(msg.value * 100) + '%', 0.55 + msg.value * 0.45);
+        const phase = msg.phase || (isMp3 ? 'Кодирование MP3' : 'Перекодирование в H.264/AAC');
+        t.set(phase + '… ' + Math.round(msg.value * 100) + '%', 0.55 + msg.value * 0.45);
+        q.upd(phase.toLowerCase(), 0.55 + msg.value * 0.45);
       }
       if (msg && msg.t === 'ytdl-run-log') runStep(String(msg.msg || ''));
       if (msg && msg.t === 'ytdl-vot-status') {
         t.set('Перевод (VOT): ' + msg.text, 0.55);
+        q.upd('перевод: ' + msg.text, 0.55);
         if (msg.text !== lastVot) { lastVot = msg.text; runStep('VOT: ' + msg.text); }
       }
     };
@@ -1267,39 +1595,53 @@
       ctx.stage = 'захват потока';
       runStep('захват потока начат');
       let lastQ = 0;
-      const result = await download({ height, format, start, end }, (d) => {
+      const result = await download({ height, format, start, end, capMin }, (d) => {
         t.set('Загрузка сегментов ' + label + '… ' + Math.round(d.progress * 100) + '%', d.progress * 0.5);
-        const q = Math.floor((d.progress || 0) * 4);
-        if (q > lastQ && q < 4) { lastQ = q; runStep('захват ' + q * 25 + '%'); }
+        q.upd('загрузка сегментов', d.progress * 0.5);
+        const quarter = Math.floor((d.progress || 0) * 4);
+        if (quarter > lastQ && quarter < 4) { lastQ = quarter; runStep('захват ' + quarter * 25 + '%'); }
       });
+      // Захват мог сдаться на плато буфера или упереться в 20-минутный потолок —
+      // тогда он вернул меньше запрошенного. Считаем по фактическому краю, иначе
+      // ffmpeg получит -t от запрошенного диапазона, а имя файла соврёт о длине.
+      const effEnd = result.partial ? Math.floor(result.partial.to) : end;
+      const partialNote = result.partial
+        ? 'захвачено только до ' + fmtTime(effEnd) + ' из ' + fmtTime(end) : '';
+      if (partialNote) { runStep('захват неполный: ' + partialNote); filename = mkName(effEnd); }
+
       ctx.stage = 'сборка файла (ffmpeg)';
       runStep('захват завершён, сборка файла (ffmpeg)');
+      q.upd('сборка файла', 0.55);
       t.set((isMp3 ? 'Кодирование MP3…'
         : (transcode ? 'Готовлю перекодирование (может занять дольше ролика)…' : 'Склейка дорожек…')) + sbNote, 0.55);
 
-      const ext = isMp3 ? '.mp3' : '.mp4';
-      const filename = safeName(info.title) + (isMp3 ? '' : ' [' + height + 'p]') +
-        fragSuffix(start, end, duration) + ext;
-
       const res = await muxViaOffscreen({
-        format,
+        jobId, format, audioRaw, videoId: info.videoId,
         video: isMp3 ? null : result._v,
         audio: result._a,
         videoMime: result.video && result.video.mime,
         audioMime: result.audio && result.audio.mime,
-        filename, transcode: doTranscode, start, end,
+        filename, transcode: doTranscode, start, end: effEnd,
         sb: sbSegments, vot,
       });
 
       if (!res || !res.ok) throw new Error(res && res.error || 'mux failed');
-      t.set('Готово: ' + (res.filename || filename) + sbNote, 1);
-      t.hide(4000);
-      runStep('файл сохранён: ' + (res.filename || filename));
+      // Оговорки не должны теряться: перевод мог не встроиться, а захват — не
+      // добрать диапазон; и то и другое раньше уходило в очередь как чистое «готово».
+      const warns = [];
+      if (partialNote) warns.push(partialNote);
+      if (vot && !res.votApplied) warns.push('без перевода' + (res.votError ? ': ' + res.votError : ''));
+      const warn = warns.join('; ');
+      t.set((warn ? 'Готово (' + warn + '): ' : 'Готово: ') + (res.filename || filename) + sbNote, 1);
+      t.hide(warn ? 8000 : 4000);
+      runStep('файл сохранён: ' + (res.filename || filename) + (warn ? ' — ' + warn : ''));
       runEnd('успех');
+      q.end('done', { filename: res.filename || filename, warn });
     } catch (err) {
       t.fail(err, ctx);
       runStep('ошибка на шаге «' + ctx.stage + '»');
       runEnd('ошибка', err);
+      q.end('error', { error: String((err && err.message) || err), note: ctx.stage });
     } finally {
       chrome.runtime.onMessage.removeListener(onProg);
     }
@@ -1324,7 +1666,8 @@
   async function muxAttempt(job) {
     const CHUNK = 4 * 1024 * 1024;
     const beg = await toOffscreen({
-      t: 'ytdl-begin', filename: job.filename, format: job.format,
+      t: 'ytdl-begin', job: job.jobId, filename: job.filename, format: job.format,
+      audioRaw: !!job.audioRaw, videoId: job.videoId || '',
       videoMime: job.videoMime, audioMime: job.audioMime,
       transcode: !!job.transcode, start: job.start, end: job.end,
       sb: job.sb || [], vot: job.vot || null,
@@ -1337,7 +1680,7 @@
         const slice = view.subarray(off, Math.min(off + CHUNK, view.length));
         let r = null;
         try {
-          r = await toOffscreen({ t: 'ytdl-chunk', track: name, b64: b64encode(slice) });
+          r = await toOffscreen({ t: 'ytdl-chunk', job: job.jobId, track: name, b64: b64encode(slice) });
         } catch (e) { r = { ok: false, error: String(e) }; }
         if (!r || !r.ok) {
           throw new Error('передача данных прервалась (' + name + ', ' +
@@ -1348,7 +1691,7 @@
     };
     await sendTrack('video', job.video);
     await sendTrack('audio', job.audio);
-    return toOffscreen({ t: 'ytdl-finalize' });
+    return toOffscreen({ t: 'ytdl-finalize', job: job.jobId });
   }
 
   // The offscreen ffmpeg document can die mid-transfer (usually OOM on long
@@ -1384,6 +1727,8 @@
         height: opts.height, format: opts.format, transcode: opts.transcode,
         start: opts.start, end: opts.end, sb: opts.sb,
         tabsMode: String(opts.parTabs), chunkMin: Number(opts.parChunk) || 12,
+        // для очереди: воркер сам заводит запись, но подписать её может только вкладка
+        name: info.title || 'видео', label: opts.label || '', dest: opts.dest || 'local',
       });
     } catch (e) {}
     if (!resp || !resp.ok) {
@@ -1398,6 +1743,7 @@
       runEnd('ошибка', err);
       return;
     }
+    queueAutoOpen();
     runParallelUI(resp.taskId, opts, filename);
   }
 
@@ -1526,14 +1872,14 @@
   }
 
   // ---- parallel download: worker-tab loop ----------------------------------
-  async function sendTrackPar(taskId, idx, name, buf) {
+  async function sendTrackPar(taskId, idx, att, name, buf) {
     if (!buf) return;
     const CHUNK = 4 * 1024 * 1024;
     const view = new Uint8Array(buf);
     for (let off = 0; off < view.length; off += CHUNK) {
       const slice = view.subarray(off, Math.min(off + CHUNK, view.length));
       let r = null;
-      try { r = await toOffscreen({ t: 'ytdl-par-chunk', task: taskId, idx, track: name, b64: b64encode(slice) }); }
+      try { r = await toOffscreen({ t: 'ytdl-par-chunk', task: taskId, idx, att, track: name, b64: b64encode(slice) }); }
       catch (e) { r = { ok: false, error: String(e) }; }
       if (!r || !r.ok) throw new Error('передача фрагмента прервалась (' + name + '): ' + ((r && r.error) || 'нет ответа'));
     }
@@ -1572,6 +1918,9 @@
 
   async function runWorker(taskId) {
     await keepTabAwake();
+    // потолок захвата бьёт прежде всего по фоновым вкладкам — они и тормозят
+    let capMin = 20;
+    try { capMin = Number((await chrome.storage.local.get('capMin')).capMin) || 20; } catch (e) {}
     // wait for the player to be ready; background tabs stay "cued" until playback
     // starts, so nudge the (muted) player every couple of seconds
     for (let i = 0; i < 90; i++) {
@@ -1589,23 +1938,32 @@
       if (a.stop) { dropKeepAwake(); return; } // nothing left — background closes this tab
       if (a.wait) { await sleep(4000); continue; } // paused
       try {
-        const result = await download({ height: a.height, format: a.format, start: a.s, end: a.e }, (d) => {
-          try { chrome.runtime.sendMessage({ t: 'ytdl-par-prog', taskId, idx: a.idx, pct: d.progress }); } catch (e) {}
+        // att — номер попытки этого фрагмента: воркер по нему отсекает сообщения
+        // вкладки, которую сторож уже признал зависшей и переназначил фрагмент
+        const result = await download({ height: a.height, format: a.format, start: a.s, end: a.e, capMin }, (d) => {
+          try { chrome.runtime.sendMessage({ t: 'ytdl-par-prog', taskId, idx: a.idx, att: a.att, pct: d.progress }); } catch (e) {}
         });
+        // Кусок склейки обязан быть целым: захват сдаётся на плато буфера и по
+        // 20-минутному потолку, и такой недобор раньше уходил как «фрагмент готов»
+        // — в итоге собранное видео молча теряло минуты в середине.
+        if (result.partial) {
+          throw new Error('захвачено только до ' + fmtTime(result.partial.to) +
+            ' из ' + fmtTime(result.partial.wanted));
+        }
         const beg = await toOffscreen({
-          t: 'ytdl-par-begin', task: taskId, idx: a.idx,
+          t: 'ytdl-par-begin', task: taskId, idx: a.idx, att: a.att,
           videoMime: result.video && result.video.mime,
           audioMime: result.audio && result.audio.mime,
         });
         if (!beg || !beg.ok) throw new Error('offscreen не принял фрагмент: ' + ((beg && beg.error) || 'нет ответа'));
-        await sendTrackPar(taskId, a.idx, 'video', result._v);
-        await sendTrackPar(taskId, a.idx, 'audio', result._a);
-        const fin = await toOffscreen({ t: 'ytdl-par-frag', task: taskId, idx: a.idx });
+        await sendTrackPar(taskId, a.idx, a.att, 'video', result._v);
+        await sendTrackPar(taskId, a.idx, a.att, 'audio', result._a);
+        const fin = await toOffscreen({ t: 'ytdl-par-frag', task: taskId, idx: a.idx, att: a.att });
         if (!fin || !fin.ok) throw new Error((fin && fin.error) || 'фрагмент не сохранился');
-        await chrome.runtime.sendMessage({ t: 'ytdl-par-frag-done', taskId, idx: a.idx });
+        await chrome.runtime.sendMessage({ t: 'ytdl-par-frag-done', taskId, idx: a.idx, att: a.att });
       } catch (e) {
         console.warn('[Triangle] фрагмент', a.idx, 'ошибка:', e);
-        try { await chrome.runtime.sendMessage({ t: 'ytdl-par-frag-fail', taskId, idx: a.idx, error: String((e && e.message) || e) }); } catch (e2) {}
+        try { await chrome.runtime.sendMessage({ t: 'ytdl-par-frag-fail', taskId, idx: a.idx, att: a.att, error: String((e && e.message) || e) }); } catch (e2) {}
         await sleep(2000);
       }
     }

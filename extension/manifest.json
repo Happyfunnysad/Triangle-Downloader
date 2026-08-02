@@ -3,7 +3,7 @@
   "name": "Triangle Downloader",
   "version": "1.5.0",
   "description": "Скачивает видео, аудио и субтитры YouTube, вырезает SponsorBlock и добавляет VOT-перевод. Без yt-dlp.",
-  "permissions": ["downloads", "offscreen", "storage", "tabs", "notifications", "nativeMessaging", "declarativeNetRequest"],
+  "permissions": ["alarms", "downloads", "offscreen", "storage", "tabs", "notifications", "nativeMessaging", "declarativeNetRequest"],
   "host_permissions": ["*://www.youtube.com/*", "https://sponsor.ajay.app/*", "https://*/*", "http://*/*"],
   "background": { "service_worker": "background.js" },
   "declarative_net_request": {

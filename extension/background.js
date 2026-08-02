@@ -5,7 +5,9 @@
 // tells the offscreen ffmpeg to merge the pieces into one file.
 
 let creating = null;      // de-dupe concurrent createDocument calls
-let progressTab = null;   // tab that started the current single-mode job
+// job -> вкладка, которая его запустила. Раньше это была одна переменная, и
+// вторая загрузка уводила себе прогресс, журнал и статус перевода первой.
+const progressTabs = new Map();
 
 // ---- offscreen lifecycle --------------------------------------------------
 function pingOffscreen() {
@@ -64,7 +66,7 @@ async function missingFiles() {
 
 // ---- SponsorBlock ---------------------------------------------------------
 const SB_API = 'https://sponsor.ajay.app';
-const SB_CATEGORIES = ['sponsor', 'selfpromo', 'interaction'];
+const SB_CATEGORIES = ['sponsor', 'selfpromo', 'interaction']; // по умолчанию
 
 async function sha256Hex(s) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
@@ -73,9 +75,15 @@ async function sha256Hex(s) {
 
 async function sbFetchSegments(videoId) {
   if (!videoId) return [];
+  let cats = SB_CATEGORIES;
+  try {
+    const saved = (await chrome.storage.local.get('sbCats')).sbCats;
+    // снятые все галочки — это «ничего не вырезать», а не «вернуть умолчания»
+    if (Array.isArray(saved)) { if (!saved.length) return []; cats = saved; }
+  } catch (e) { /* без настройки — категории по умолчанию */ }
   const prefix = (await sha256Hex(videoId)).slice(0, 4);
   const url = SB_API + '/api/skipSegments/' + prefix +
-    '?categories=' + encodeURIComponent(JSON.stringify(SB_CATEGORIES));
+    '?categories=' + encodeURIComponent(JSON.stringify(cats));
   const resp = await fetch(url);
   if (resp.status === 404) return [];
   if (!resp.ok) throw new Error('SponsorBlock HTTP ' + resp.status);
@@ -121,6 +129,40 @@ function makeFrags(start, end, chunkSec) {
 
 function jobFor(taskId) { return jobs[taskId] || null; }
 
+// Слепок задания: всё, чего хватает, чтобы запустить загрузку заново, когда
+// исходной вкладки уже нет. Живёт в записи очереди (см. qAdd), поэтому повтор
+// не зависит ни от страницы, с которой качали, ни от самого задания.
+function specOf(msg) {
+  return {
+    url: msg.url, videoId: msg.videoId,
+    height: msg.height, format: msg.format, transcode: !!msg.transcode,
+    start: msg.start, end: msg.end, sb: msg.sb || [], filename: msg.filename,
+    tabsMode: String(msg.tabsMode == null ? 'auto' : msg.tabsMode),
+    chunkMin: Number(msg.chunkMin) || 12,
+    vot: !!msg.vot,
+  };
+}
+
+// mainTab == null — задание ничьё: фоновые вкладки для фрагментов оно открывает
+// себе само, поэтому так запускается повтор при закрытом видео.
+function createJob(spec, mainTab) {
+  const range = spec.end - spec.start;
+  let workers = spec.tabsMode === 'auto' ? autoWorkers(range)
+    : Math.max(1, Math.min(MAX_TABS, Number(spec.tabsMode) || 1));
+  const chunkSec = Math.max(300, Math.min(1800, (Number(spec.chunkMin) || 12) * 60));
+  const frags = makeFrags(spec.start, spec.end, chunkSec);
+  workers = Math.min(workers, frags.length);
+  const id = 't' + (taskSeq++) + '_' + Date.now();
+  return (jobs[id] = {
+    id, state: 'run', url: spec.url, videoId: spec.videoId,
+    height: spec.height, format: spec.format, transcode: !!spec.transcode,
+    start: spec.start, end: spec.end, sb: spec.sb || [],
+    filename: spec.filename, frags, workers,
+    tabs: new Set(), mainTab: mainTab == null ? null : mainTab,
+    startedAt: Date.now(), mergePct: 0, error: null,
+  });
+}
+
 function closeTab(tabId) {
   if (tabId != null) setTimeout(() => chrome.tabs.remove(tabId).catch(() => {}), 200);
 }
@@ -143,12 +185,30 @@ async function spawnTabs(job) {
 
 function requeueFrag(job, f, reason) {
   if (f.st === 'done') return;
+  // Попытка недействительна прямо сейчас, а не со следующего клейма: иначе
+  // догоняющее «готово» от зависшей вкладки приходило с ещё живым номером и
+  // закрывало фрагмент, который только что вернули в очередь.
+  f.att = (f.att || 0) + 1;
   f.tries++;
   f.tabId = null;
   f.pct = 0;
   f.st = f.tries >= FRAG_TRIES ? 'err' : 'pend';
   if (f.st === 'err') f.err = reason || 'превышено число попыток';
   console.warn('[Triangle] фрагмент', f.idx, '→', f.st, '(' + (reason || '') + ')');
+}
+
+// Повтор сорвавшегося задания. Если фрагментов с ошибкой нет — значит сорвалась
+// сама склейка, а её исходные данные offscreen уже выбросил (par-merge чистит за
+// собой в finally). Пересобирать тогда нечего: фрагменты качаются заново, иначе
+// повтор мгновенно падал с «нет данных задачи» вместо настоящей причины.
+function retryFrags(job) {
+  const bad = job.frags.filter((f) => f.st === 'err');
+  for (const f of (bad.length ? bad : job.frags)) {
+    f.att = (f.att || 0) + 1; // прошлые вкладки этого фрагмента больше не в счёт
+    f.st = 'pend'; f.tries = 0; f.err = null; f.pct = 0; f.tabId = null;
+  }
+  job.state = 'run';
+  job.error = null;
 }
 
 // called from the status poll (every second while the main tab is open) — this
@@ -181,14 +241,16 @@ function jobProgress(job) {
 async function maybeMerge(job) {
   if (job.state !== 'run') return;
   if (job.frags.some((f) => f.st === 'pend' || f.st === 'run')) return;
-  if (job.frags.some((f) => f.st === 'err')) { job.state = 'stall'; return; } // wait for user retry
+  if (job.frags.some((f) => f.st === 'err')) { job.state = 'stall'; qSyncJob(job); return; } // wait for user retry
   job.state = 'merge';
   job.mergePct = 0;
+  job.mergeId = (job.mergeId || 0) + 1; // ответ прошлой склейки уже неактуален
+  qSyncJob(job);
   closeAllTabs(job);
   try {
     await ensureOffscreen();
     const ack = await chrome.runtime.sendMessage({
-      t: 'ytdl-par-merge', task: job.id, filename: job.filename,
+      t: 'ytdl-par-merge', task: job.id, mergeId: job.mergeId, filename: job.filename,
       format: job.format, transcode: job.transcode,
       start: job.start, end: job.end, sb: job.sb,
       frags: job.frags.map((f) => ({ idx: f.idx, s: f.s, e: f.e })),
@@ -198,16 +260,155 @@ async function maybeMerge(job) {
   } catch (e) {
     job.state = 'error';
     job.error = String((e && e.message) || e);
+    qSyncJob(job);
     notify('Ошибка: ' + job.error);
   }
 }
 
 function cancelJob(job, silent) {
   job.state = 'cancel';
+  qSyncJob(job);
   closeAllTabs(job);
   chrome.runtime.sendMessage({ t: 'ytdl-par-drop', task: job.id }).catch(() => {});
   if (!silent) notify('Загрузка отменена');
   setTimeout(() => { delete jobs[job.id]; }, 30000);
+}
+
+// ---- очередь загрузок ------------------------------------------------------
+// Единый список заданий — и однотабных, и параллельных. Живёт в service worker,
+// а не во вкладке: качать можно из нескольких вкладок YouTube сразу, и панель
+// очереди в любой из них должна показывать всё, что идёт прямо сейчас.
+// Вкладка лишь сообщает о своих шагах; параллельные задания отражаются из jobs.
+const queue = [];
+let queueSeq = 1;
+const QUEUE_MAX = 30;
+const QUEUE_KEEP_MS = 10 * 60 * 1000;            // успешные держим 10 минут
+const QUEUE_KEEP_FAIL_MS = 24 * 60 * 60 * 1000;  // сорвавшиеся — сутки: их ещё повторять
+const QUEUE_KEY = 'dlQueue';
+
+// MV3 усыпляет service worker через полминуты простоя, а вместе с ним исчезла бы
+// и очередь — то есть слепок сорвавшейся загрузки, единственное, по чему её можно
+// повторить. Поэтому список переживает выгрузку в chrome.storage.
+let qSaveTimer = null;
+function qSave(now) {
+  const write = () => {
+    qSaveTimer = null;
+    try { chrome.storage.local.set({ [QUEUE_KEY]: queue }).catch(() => {}); } catch (e) {}
+  };
+  // Появление и завершение задания пишем сразу — именно на них воркер обычно и
+  // засыпает. Частые шаги (прогресс) — не чаще раза в секунду, причём НЕ сдвигая
+  // уже назначенную запись: панель опрашивает очередь ровно раз в секунду, и
+  // сдвиг откладывал бы сохранение до бесконечности.
+  if (now) { clearTimeout(qSaveTimer); write(); return; }
+  if (!qSaveTimer) qSaveTimer = setTimeout(write, 1000);
+}
+
+// Сами задания (jobs) живут только в памяти и восстановлению не подлежат,
+// поэтому всё, что числилось идущим, при загрузке помечаем прерванным —
+// со слепком такую запись можно просто повторить.
+const qReady = (async () => {
+  let saved = [];
+  try { saved = (await chrome.storage.local.get(QUEUE_KEY))[QUEUE_KEY] || []; } catch (e) {}
+  for (const it of saved) {
+    if (queue.some((x) => x.id === it.id)) continue;
+    if (!it.finishedAt) {
+      it.state = 'error';
+      it.error = it.error || 'загрузка прервана — расширение выгружалось';
+      it.note = 'прервано';
+      it.taskId = null;
+      it.finishedAt = Date.now();
+    }
+    queue.push(it);
+  }
+  for (const it of queue) {
+    const n = Number(String(it.id).replace(/^q/, '')) || 0;
+    if (n >= queueSeq) queueSeq = n + 1;
+  }
+  qSweep();
+})();
+
+function qAdd(fields) {
+  const item = Object.assign({
+    id: 'q' + (queueSeq++),
+    name: 'видео', label: '', mode: 'single', state: 'run',
+    progress: 0, note: '', warn: '', taskId: null, tabId: null, videoId: null,
+    dest: 'local', filename: null, error: null,
+    spec: null, // слепок для повтора, см. specOf
+    startedAt: Date.now(), finishedAt: null,
+  }, fields || {});
+  queue.push(item);
+  qSweep();
+  qSave(true);
+  return item;
+}
+
+function qGet(id) { return queue.find((q) => q.id === id) || null; }
+function qByTask(taskId) { return queue.find((q) => q.taskId === taskId) || null; }
+
+function qFinish(item, state, extra) {
+  if (!item) return;
+  if (extra) for (const k of ['filename', 'error', 'note', 'warn']) {
+    if (extra[k] != null) item[k] = extra[k];
+  }
+  item.state = state;
+  if (state === 'done') item.progress = 1;
+  if (!item.finishedAt) item.finishedAt = Date.now();
+  qSave(true);
+}
+
+// Завершённые записи не нужны вечно: они уходят через QUEUE_KEEP_MS, а список
+// целиком ограничен QUEUE_MAX — при переполнении выбывают самые старые
+// завершённые (идущие задания не выбрасываем никогда).
+function qSweep() {
+  const now = Date.now();
+  for (let i = queue.length - 1; i >= 0; i--) {
+    const q = queue[i];
+    const keep = q.state === 'done' ? QUEUE_KEEP_MS : QUEUE_KEEP_FAIL_MS;
+    if (q.finishedAt && now - q.finishedAt > keep) queue.splice(i, 1);
+  }
+  while (queue.length > QUEUE_MAX) {
+    const i = queue.findIndex((q) => q.finishedAt);
+    if (i < 0) break;
+    queue.splice(i, 1);
+  }
+}
+
+// Параллельное задание живёт в jobs — запись очереди лишь отражает его.
+function qSyncJob(job) {
+  const item = qByTask(job.id);
+  if (!item) return;
+  item.state = job.state;
+  item.filename = job.filename || item.filename;
+  item.error = job.error || item.error;
+  item.progress = job.state === 'done' ? 1
+    : job.state === 'merge' ? 0.9 + 0.1 * (job.mergePct || 0)
+    : jobProgress(job) * 0.9;
+  const done = job.frags.filter((f) => f.st === 'done').length;
+  const bad = job.frags.filter((f) => f.st === 'err').length;
+  item.note = job.state === 'merge' ? 'склейка фрагментов'
+    : job.state === 'stall' ? 'фрагментов с ошибкой: ' + bad
+    : job.state === 'pause' ? 'приостановлено'
+    : job.state === 'error' ? (job.error || 'ошибка')
+    : job.state === 'cancel' ? 'отменено на ' + done + ' фрагментах из ' + job.frags.length
+    : 'фрагментов ' + done + ' из ' + job.frags.length + ' · вкладок ' + job.tabs.size;
+  const over = job.state === 'done' || job.state === 'error' || job.state === 'cancel';
+  if (over && !item.finishedAt) item.finishedAt = Date.now();
+  qSave(over);
+}
+
+// наружу отдаём явный набор полей, чтобы внутренние потроха задания не утекали
+function qPublic(q) {
+  return {
+    id: q.id, name: q.name, label: q.label, mode: q.mode, state: q.state,
+    progress: Math.max(0, Math.min(1, q.progress || 0)), note: q.note, warn: q.warn,
+    dest: q.dest, filename: q.filename, error: q.error,
+    startedAt: q.startedAt, finishedAt: q.finishedAt,
+    cancelable: !!q.taskId && !q.finishedAt,
+    // повторить можно сорвавшееся — либо переподняв живое задание, либо целиком
+    // по слепку (тогда исходная вкладка и не нужна)
+    retryable: (q.state === 'error' || q.state === 'cancel' || q.state === 'stall') &&
+      !!(q.spec || (q.taskId && jobs[q.taskId])),
+  };
 }
 
 // ---- журнал запусков -------------------------------------------------------
@@ -345,12 +546,21 @@ function notify(message) {
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  for (const [job, id] of progressTabs) if (id === tabId) progressTabs.delete(job);
+  // однотабная загрузка умирает вместе со своей вкладкой и уже ничего о себе не
+  // сообщит — закрываем её запись сами, иначе она навсегда осталась бы «идёт»
+  for (const q of queue) {
+    if (q.tabId === tabId && q.mode === 'single' && !q.finishedAt) {
+      qFinish(q, 'cancel', { note: 'вкладка закрыта' });
+    }
+  }
   for (const id of Object.keys(jobs)) {
     const job = jobs[id];
-    if (job.mainTab === tabId && (job.state === 'run' || job.state === 'pause' || job.state === 'stall')) {
-      cancelJob(job, true); // main page closed → cancel + cleanup
-      continue;
-    }
+    // Раньше закрытие исходной страницы отменяло загрузку. Теперь задание живёт
+    // в воркере само (фрагменты качают его собственные фоновые вкладки, склейку
+    // делает offscreen, файл сохраняет воркер), а следить за ним можно из панели
+    // очереди в любой вкладке YouTube — поэтому просто отвязываем вкладку.
+    if (job.mainTab === tabId) job.mainTab = null;
     if (job.tabs.has(tabId)) {
       job.tabs.delete(tabId);
       const f = job.frags.find((x) => x.tabId === tabId && x.st === 'run');
@@ -358,6 +568,28 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       spawnTabs(job);
       maybeMerge(job);
     }
+  }
+});
+
+// ---- сторож заданий --------------------------------------------------------
+// Сторож (watchdog) раньше ездил на опросе ytdl-par-status из вкладки, которая
+// начала загрузку. Теперь задание эту вкладку переживает, и опрашивать его может
+// быть уже некому — поэтому воркер будит себя сам.
+const WATCH_ALARM = 'ytdl-watchdog';
+
+function ensureWatchAlarm() {
+  try { chrome.alarms.create(WATCH_ALARM, { periodInMinutes: 1 }); } catch (e) {}
+}
+chrome.runtime.onInstalled.addListener(ensureWatchAlarm);
+chrome.runtime.onStartup.addListener(ensureWatchAlarm);
+ensureWatchAlarm();
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== WATCH_ALARM) return;
+  qSweep();
+  for (const id of Object.keys(jobs)) {
+    watchdog(jobs[id]);  // сам проверит состояние задания
+    qSyncJob(jobs[id]);
   }
 });
 
@@ -375,7 +607,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // ffmpeg progress / VOT status / вехи журнала: offscreen → worker → tab
   // (runtime messages don't reach content scripts)
   if (msg.t === 'ytdl-progress' || msg.t === 'ytdl-vot-status' || msg.t === 'ytdl-run-log') {
-    if (progressTab != null) chrome.tabs.sendMessage(progressTab, msg).catch(() => {});
+    const tab = progressTabs.get(msg.job);
+    if (tab != null) chrome.tabs.sendMessage(tab, msg).catch(() => {});
     return;
   }
 
@@ -389,12 +622,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.t === 'ytdl-proxy') {
     (async () => {
       const inner = msg.m || {};
-      if (inner.t === 'ytdl-begin') {
-        progressTab = senderTab != null ? senderTab : null;
-        await ensureOffscreen();
-      }
-      if (inner.t === 'ytdl-vot-start') {
-        if (senderTab != null) progressTab = senderTab;
+      if (inner.t === 'ytdl-begin' || inner.t === 'ytdl-vot-start') {
+        if (senderTab != null && inner.job) progressTabs.set(inner.job, senderTab);
         await ensureOffscreen();
       }
       if (inner.t === 'ytdl-par-begin') await ensureOffscreen();
@@ -415,6 +644,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.t === 'ytdl-save') {
+    // Отменённое задание не сохраняем и уж точно никуда не отправляем: склейка
+    // идёт минутами, и её последняя проверка отмены могла разминуться с нажатием.
+    if (msg.task) {
+      const job = jobFor(msg.task);
+      if (!job || job.state === 'cancel') { sendResponse({ ok: false, error: 'задание отменено' }); return; }
+    }
     chrome.downloads.download({ url: msg.url, filename: msg.filename, saveAs: false })
       .then((id) => {
         // служебные файлы (журнал отладки) получателям не доставляются;
@@ -473,30 +708,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.t === 'ytdl-par-start') {
-    const range = msg.end - msg.start;
-    let workers = msg.tabsMode === 'auto' ? autoWorkers(range)
-      : Math.max(1, Math.min(MAX_TABS, Number(msg.tabsMode) || 1));
-    const chunkSec = Math.max(300, Math.min(1800, (Number(msg.chunkMin) || 12) * 60));
-    const frags = makeFrags(msg.start, msg.end, chunkSec);
-    workers = Math.min(workers, frags.length);
-    const id = 't' + (taskSeq++) + '_' + Date.now();
-    const job = jobs[id] = {
-      id, state: 'run', url: msg.url, videoId: msg.videoId,
-      height: msg.height, format: msg.format, transcode: !!msg.transcode,
-      start: msg.start, end: msg.end, sb: msg.sb || [],
-      filename: msg.filename, frags, workers,
-      tabs: new Set(), mainTab: senderTab, startedAt: Date.now(),
-      mergePct: 0, error: null,
-    };
-    spawnTabs(job);
-    sendResponse({ ok: true, taskId: id, frags: frags.length, workers });
-    return;
+    qReady.then(() => { // см. ytdl-q-add: запись заводим только по восстановленной очереди
+      const spec = specOf(msg);
+      const job = createJob(spec, senderTab);
+      qAdd({
+        name: msg.name || msg.filename, label: msg.label || '', mode: 'par',
+        taskId: job.id, tabId: senderTab, videoId: msg.videoId,
+        dest: msg.dest || 'local', filename: msg.filename, spec,
+      });
+      qSyncJob(job);
+      spawnTabs(job);
+      sendResponse({ ok: true, taskId: job.id, frags: job.frags.length, workers: job.workers });
+    });
+    return true;
   }
 
   if (msg.t === 'ytdl-par-status') {
     const job = jobFor(msg.taskId);
     if (!job) { sendResponse({ ok: false, gone: true }); return; }
     watchdog(job);
+    qSyncJob(job);
     const pct = jobProgress(job);
     const elapsed = (Date.now() - job.startedAt) / 1000;
     sendResponse({
@@ -515,12 +746,121 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     else if (msg.cmd === 'resume' && job.state === 'pause') { job.state = 'run'; spawnTabs(job); }
     else if (msg.cmd === 'cancel') cancelJob(job, true);
     else if (msg.cmd === 'retry' && (job.state === 'stall' || job.state === 'error')) {
-      for (const f of job.frags) if (f.st === 'err') { f.st = 'pend'; f.tries = 0; f.err = null; }
-      job.state = 'run'; job.error = null;
+      retryFrags(job);
       spawnTabs(job);
     }
+    qSyncJob(job);
     sendResponse({ ok: true });
     return;
+  }
+
+  // ---- очередь загрузок ----
+  if (msg.t === 'ytdl-q-add') {
+    // строго после восстановления списка: иначе после холодного пробуждения
+    // воркера новая запись получала id, который затем занимал восстановленный
+    // элемент, и прогресс уезжал в чужую строку
+    qReady.then(() => {
+      const item = qAdd({
+        name: msg.name, label: msg.label, mode: 'single', tabId: senderTab,
+        videoId: msg.videoId, dest: msg.dest || 'local', note: msg.note || '',
+        spec: msg.spec ? specOf(msg.spec) : null,
+      });
+      sendResponse({ ok: true, id: item.id });
+    });
+    return true;
+  }
+
+  if (msg.t === 'ytdl-q-upd') {
+    const item = qGet(msg.id);
+    if (item && !item.finishedAt) {
+      if (msg.progress != null) item.progress = Number(msg.progress) || 0;
+      if (msg.note != null) item.note = String(msg.note);
+      if (msg.state) item.state = msg.state;
+      qSave();
+    }
+    sendResponse({ ok: !!item });
+    return;
+  }
+
+  if (msg.t === 'ytdl-q-end') {
+    qFinish(qGet(msg.id), msg.state || 'done',
+      { filename: msg.filename, error: msg.error, note: msg.note, warn: msg.warn });
+    sendResponse({ ok: true });
+    return;
+  }
+
+  // «Показать в папке»: id загрузки нигде не хранится, а искать по имени — то же
+  // самое одним запросом. Не нашлось (файл переместили) — открываем саму папку.
+  if (msg.t === 'ytdl-q-show') {
+    chrome.downloads.search({ query: [String(msg.filename || '')], limit: 1, orderBy: ['-startTime'] })
+      .then((list) => {
+        if (list && list[0]) chrome.downloads.show(list[0].id);
+        else chrome.downloads.showDefaultFolder();
+      })
+      .catch(() => { try { chrome.downloads.showDefaultFolder(); } catch (e) {} });
+    return;
+  }
+
+  if (msg.t === 'ytdl-q-list') {
+    // ждём восстановления списка из хранилища, иначе первый после пробуждения
+    // воркера опрос вернул бы пустую очередь
+    qReady.then(() => {
+      // Задание может быть ничьим — исходную вкладку закрыли, ytdl-par-status никто
+      // не опрашивает. Тогда именно этот опрос и переносит его состояние в очередь.
+      for (const id of Object.keys(jobs)) qSyncJob(jobs[id]);
+      qSweep();
+      sendResponse({ ok: true, items: queue.map(qPublic) });
+    });
+    return true;
+  }
+
+  if (msg.t === 'ytdl-q-ctl') {
+    qReady.then(() => {
+      if (msg.cmd === 'clear') {
+        for (let i = queue.length - 1; i >= 0; i--) if (queue[i].finishedAt) queue.splice(i, 1);
+      } else {
+        const item = qGet(msg.id);
+        if (item && msg.cmd === 'remove' && item.finishedAt) queue.splice(queue.indexOf(item), 1);
+        // отменить можно только параллельное задание: однотабный захват идёт
+        // внутри страницы и прервать его на полпути нечем
+        if (item && msg.cmd === 'cancel' && item.taskId) {
+          const job = jobFor(item.taskId);
+          if (job) cancelJob(job, true); else qFinish(item, 'cancel');
+        }
+        if (item && msg.cmd === 'retry') {
+          const live = item.taskId ? jobFor(item.taskId) : null;
+          if (live && (live.state === 'stall' || live.state === 'error')) {
+            // задание ещё цело — дешевле переподнять только сломавшиеся фрагменты
+            retryFrags(live);
+            item.warn = '';
+            spawnTabs(live);
+            qSyncJob(live);
+          } else if (item.spec) {
+            // Задания уже нет (или его и не было — сорвалась однотабная загрузка).
+            // Поднимаем всё заново по слепку: вкладки для фрагментов задание
+            // открывает себе само, поэтому исходное видео может быть давно закрыто.
+            const fresh = createJob(item.spec, null);
+            item.taskId = fresh.id;
+            item.tabId = null;
+            item.mode = 'par';
+            item.state = 'run';
+            item.progress = 0;
+            item.error = null;
+            item.finishedAt = null;
+            item.note = 'повтор запущен';
+            // повтор идёт через параллельную сборку, а она перевод не умеет
+            item.warn = item.spec.vot ? 'перевод VOT при повторе не переносится' : '';
+            spawnTabs(fresh);
+          } else {
+            item.warn = 'повторить нечем: параметры загрузки не сохранились';
+          }
+        }
+      }
+      qSweep();
+      qSave(true);
+      sendResponse({ ok: true, items: queue.map(qPublic) });
+    });
+    return true;
   }
 
   // ---- parallel: worker tab API ----
@@ -540,16 +880,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       maybeMerge(job);
       return;
     }
+    // Номер попытки. Зависшую вкладку сторож перевыдаёт другой, но старая жива
+    // ещё минуты и досылает свои frag-done/fail — без этого номера её «готово»
+    // закрывало фрагмент, который в это время качала новая вкладка, и склейка
+    // уходила по недокачанным данным.
+    f.att = (f.att || 0) + 1;
     f.st = 'run'; f.tabId = senderTab; f.ts = Date.now(); f.pct = 0;
-    sendResponse({ ok: true, idx: f.idx, s: f.s, e: f.e, height: job.height, format: job.format, videoId: job.videoId });
+    sendResponse({ ok: true, idx: f.idx, att: f.att, s: f.s, e: f.e, height: job.height, format: job.format, videoId: job.videoId });
     return;
   }
+
+  // сообщение от прошлой попытки этого же фрагмента — оно уже ни о чём
+  const staleFrag = (f) => !f || f.att !== msg.att;
 
   if (msg.t === 'ytdl-par-prog') {
     const job = jobFor(msg.taskId);
     if (job) {
       const f = job.frags[msg.idx];
-      if (f && f.st === 'run') { f.pct = msg.pct; f.ts = Date.now(); }
+      if (!staleFrag(f) && f.st === 'run') { f.pct = msg.pct; f.ts = Date.now(); }
     }
     return; // no response needed
   }
@@ -558,7 +906,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const job = jobFor(msg.taskId);
     if (job) {
       const f = job.frags[msg.idx];
-      if (f) { f.st = 'done'; f.pct = 1; f.ts = Date.now(); }
+      if (staleFrag(f)) { sendResponse({ ok: false, stale: true }); return; }
+      f.st = 'done'; f.pct = 1; f.ts = Date.now();
       maybeMerge(job);
     }
     sendResponse({ ok: true });
@@ -569,7 +918,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const job = jobFor(msg.taskId);
     if (job) {
       const f = job.frags[msg.idx];
-      if (f) requeueFrag(job, f, msg.error);
+      if (staleFrag(f)) { sendResponse({ ok: false, stale: true }); return; }
+      requeueFrag(job, f, msg.error);
       maybeMerge(job);
     }
     sendResponse({ ok: true });
@@ -585,7 +935,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.t === 'ytdl-par-merged') {
     const job = jobFor(msg.task);
-    if (job) {
+    // Отменённое (или уже переповторённое) задание не должно воскресать: склейка
+    // идёт минутами, и её запоздалый ответ раньше перекрашивал «отменено» в
+    // «готово» — при том, что файл к тому моменту уже сохранился и уехал.
+    if (job && job.state === 'merge' && msg.mergeId === job.mergeId) {
       if (msg.ok) {
         job.state = 'done';
         job.filename = msg.filename || job.filename;
@@ -595,6 +948,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         job.error = msg.error || 'сборка не удалась';
         notify('Ошибка: ' + job.error);
       }
+      qSyncJob(job);
       setTimeout(() => { if (jobs[job.id] && (jobs[job.id].state === 'done')) delete jobs[job.id]; }, 10 * 60 * 1000);
     }
     return;

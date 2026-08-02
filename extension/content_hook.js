@@ -178,6 +178,10 @@
     const targetQ = opts.targetQ;   // e.g. 'hd1080' / 'small'
     const preQ = opts.preQ;         // a DIFFERENT low quality, to force a fresh init
     const needVideo = opts.needVideo !== false; // mp3 only needs audio
+    // Страховка от вечного захвата. По стенным часам, не по длине видео: подкачка
+    // идёт быстрее реального времени, но на медленном канале длинный диапазон в
+    // этот потолок упирается — поэтому он в настройках, а не в константе.
+    const capMs = Math.max(1, Number(opts.capMin) || 20) * 60 * 1000;
     const v = video();
     const dur = v.duration;
     if (!isFinite(dur) || dur <= 0) throw new Error('duration unknown');
@@ -235,6 +239,7 @@
     };
     const span = capEnd - capStart;
     let cursor = capStart, stall = 0, rescues = 0;
+    let reached = capStart; // докуда реально дотянулся буфер — см. return ниже
     const started = Date.now();
     try {
       try { v.pause(); } catch (e) {}
@@ -265,6 +270,7 @@
         }
 
         const edge = bufferedEndAt(cursor);
+        if (edge > reached) reached = edge;
         onProgress(Math.min(0.99, Math.max(0, edge - capStart) / span));
         if (edge >= capEnd - 0.6) break;                 // fully buffered → captured
 
@@ -283,7 +289,7 @@
             break;
           }
         }
-        if (Date.now() - started > 20 * 60 * 1000) break; // hard cap
+        if (Date.now() - started > capMs) break; // потолок из настроек
       }
     } finally {
       store.capturing = false;
@@ -295,6 +301,11 @@
       if (!prev.paused) { try { v.play(); } catch (e) {} }
     }
     onProgress(1);
+    // Оба «сдающихся» выхода из цикла (плато буфера и 20-минутный потолок) — это
+    // break, а не throw, и наверх уходило безусловное «готово»: файл получался
+    // усечённым, но с именем и длительностью запрошенного диапазона. Возвращаем
+    // фактический край, чтобы вызывающий мог сказать об этом честно.
+    return { to: reached, wanted: capEnd };
   }
 
   // ---- subtitles (read from the built-in transcript panel) -----------------
@@ -310,6 +321,15 @@
     if (!pr || !pr.captions) pr = window.ytInitialPlayerResponse;
     const tl = pr && pr.captions && pr.captions.playerCaptionsTracklistRenderer;
     return (tl && tl.captionTracks) || [];
+  }
+  // язык звуковой дорожки видео: берём код языка авто-субтитров (ASR) — это
+  // распознавание YouTube, а не выбор пользователя, поэтому надёжнее всего
+  // отражает реальный язык озвучки. Нужен, чтобы не просить VOT перевести
+  // видео на тот же язык, на котором оно уже звучит (Яндекс на такой запрос
+  // не отвечает ошибкой, а зависает в бесконечном WAITING).
+  function detectAudioLang() {
+    const asr = captionTracks().find(t => t.kind === 'asr');
+    return (asr && asr.languageCode) || '';
   }
   function expandedTranscriptPanel() {
     return [...document.querySelectorAll('ytd-engagement-panel-section-list-renderer')]
@@ -417,7 +437,7 @@
   // ---- bridge to the isolated-world UI script ------------------------------
   window.addEventListener('message', async (ev) => {
     if (ev.source !== window || !ev.data || ev.data.__ytdl_to_hook !== true) return;
-    const { cmd, reqId, height, format, start, end } = ev.data;
+    const { cmd, reqId, height, format, start, end, capMin } = ev.data;
     const reply = (payload, transfer) => window.postMessage(
       Object.assign({ __ytdl_from_hook: true, reqId }, payload), '*', transfer || []);
     try {
@@ -434,6 +454,7 @@
           title: (p && p.getVideoData && p.getVideoData().title) || document.title.replace(/ - YouTube$/, ''),
           duration: dur,
           heights: availableHeights(),
+          audioLang: detectAudioLang(),
         });
       } else if (cmd === 'play') {
         // background worker tabs: YouTube leaves the player "cued" until playback
@@ -448,13 +469,14 @@
         // (360p) to save bandwidth while keeping video/audio as separate tracks.
         const targetQ = isMp3 ? 'medium' : (Q[height] || 'hd720');
         const preQ = (targetQ === 'small' || targetQ === 'tiny' || targetQ === 'medium') ? 'tiny' : 'medium';
-        await playthrough(
-          { targetQ, preQ, start, end, needVideo: !isMp3 },
+        const cap = await playthrough(
+          { targetQ, preQ, start, end, capMin, needVideo: !isMp3 },
           (pct) => reply({ progress: pct, phase: 'buffering' }));
 
         const aud = assemble('audio');
         if (!aud) throw new Error('не удалось захватить аудио');
         const payload = { ok: true, done: true, audio: { mime: aud.mime, size: aud.bytes.byteLength } };
+        if (cap.to < cap.wanted - 1) payload.partial = { to: cap.to, wanted: cap.wanted };
         const transfers = [aud.bytes.buffer];
         payload._a = aud.bytes.buffer;
         if (!isMp3) {

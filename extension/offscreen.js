@@ -17,13 +17,28 @@ const { FFmpeg } = FFmpegWASM;
 
 let ff = null;
 let ffLoading = null;
-const acc = { video: [], audio: [], videoMime: '', audioMime: '', filename: 'video.mp4', sb: [] };
+// Однотабные задания — по ключу задания: качать можно из двух вкладок сразу, а
+// один общий acc сваливал их чанки в один массив, и склейка выдавала мешанину
+// под именем того, кто последним прислал begin.
+const singles = new Map(); // job -> acc
 const par = Object.create(null); // task -> { frags: idx -> {video,audio,mimes,vBytes,aBytes} }
 const ffLog = []; // ring buffer of recent ffmpeg log lines
 // Подпись текущей операции для тоста прогресса: без неё вкладка подписывала
 // любой прогресс «Перекодирование в H.264/AAC», даже когда шли микс перевода
 // или простая склейка без перекодирования.
 let ffPhase = '';
+let curJob = ''; // задание, которое сейчас держит ffmpeg — им подписан прогресс
+
+// У ffmpeg одна виртуальная файловая система и один буфер лога на всех: имена
+// (a.webm, list.txt, out.mp4…) не уникальны, а probeStart читает start_time из
+// общего ffLog. Поэтому сборки идут строго по одной — иначе соседняя операция
+// затирает вход, удаляет ещё нужный файл или обнуляет лог под чужим разбором.
+let ffQueue = Promise.resolve();
+function ffLock(job, fn) {
+  const p = ffQueue.then(() => { curJob = job; return fn(); });
+  ffQueue = p.catch(() => {});
+  return p;
+}
 
 async function getFF() {
   if (ff) return ff;
@@ -33,7 +48,7 @@ async function getFF() {
     inst.on('progress', ({ progress }) => {
       try {
         chrome.runtime.sendMessage({
-          t: 'ytdl-progress', value: Math.max(0, Math.min(1, progress)), phase: ffPhase,
+          t: 'ytdl-progress', value: Math.max(0, Math.min(1, progress)), phase: ffPhase, job: curJob,
         });
       } catch (e) {}
     });
@@ -170,7 +185,7 @@ async function copyCutConcat(inst, vName, aName, keep, sV, sA, vot) {
   return { data: null, chosen: null, lastErr };
 }
 
-async function finalize() {
+async function finalize(acc) {
   const inst = await getFF();
   const isMp3 = acc.format === 'mp3';
   let aName = 'a.' + extFor(acc.audioMime);
@@ -206,6 +221,7 @@ async function finalize() {
   let votTrack = null; // 'vot.mp3', если перевод идёт отдельной дорожкой
   let votLang3 = 'und';
   let votApplied = false; // при любом режиме VOT собираем только mp4 (не webm)
+  let votError = '';      // почему перевода нет — уходит наверх, а не только в тост
   let origAudio = null; // исходное аудио до микса — для сборки без перевода
   if (acc.vot) {
     let mode = acc.vot.mode || 'mix';
@@ -216,7 +232,8 @@ async function finalize() {
       votBuf = await votAwait(acc.vot);
       relayLog('VOT: дорожка перевода получена (' + Math.round(votBuf.length / 1024) + ' КБ), режим ' + mode);
     } catch (e) {
-      const m = 'Перевод (VOT): ' + String((e && e.message) || e) + ' — сохраняю без перевода';
+      votError = String((e && e.message) || e);
+      const m = 'Перевод (VOT): ' + votError + ' — сохраняю без перевода';
       note(m);
       relayLog(m);
     }
@@ -252,6 +269,7 @@ async function finalize() {
           votApplied = true;
           relayLog('VOT: дорожка перевода подготовлена (' + mode + ')');
         } else {
+          votError = 'не удалось подготовить дорожку перевода';
           const m = 'Перевод (VOT): не удалось подготовить дорожку — сохраняю без перевода';
           note(m);
           relayLog(m);
@@ -279,6 +297,20 @@ async function finalize() {
     }
   }
 
+  // Обложка для mp3 — превью видео вторым входом. Качаем один раз (assemble при
+  // активном VOT может прогоняться дважды). Не скачалось или ffmpeg её не принял —
+  // следующий прогон в runs соберёт файл без обложки, ничего не теряя.
+  let cover = null;
+  if (isMp3 && acc.videoId) {
+    try {
+      const r = await fetch('https://i.ytimg.com/vi/' + acc.videoId + '/hqdefault.jpg');
+      if (r.ok) {
+        await inst.writeFile('cover.jpg', new Uint8Array(await r.arrayBuffer()));
+        cover = 'cover.jpg';
+      }
+    } catch (e) { /* обложка необязательна */ }
+  }
+
   // Сборка — функция, потому что при активном VOT она может прогоняться дважды:
   // единственный mp4-вариант не собрался → второй заход идёт уже без перевода
   // (по исходному аудио), чтобы весь захват не пропал из-за перевода.
@@ -290,6 +322,28 @@ async function finalize() {
     const runs = [];
     if (isMp3) {
       const af = expr ? ['-af', "aselect='not(" + expr + ")',asetpts=N/SR/TB"] : [];
+      // «Оригинал»: дорожка YouTube копируется как есть — быстрее в разы и без
+      // потери качества. Вырезки SponsorBlock так сделать нельзя (нужен фильтр),
+      // поэтому с ними честно уходим в обычное кодирование.
+      if (acc.audioRaw && !expr) {
+        const webm = extFor(acc.audioMime) === 'webm';
+        const out = webm ? 'out.opus' : 'out.m4a';
+        runs.push({
+          out, type: webm ? 'audio/ogg' : 'audio/mp4', ext: webm ? '.opus' : '.m4a',
+          phase: 'Сохранение звука без перекодирования',
+          args: [...inA, ...limit, '-vn', '-c:a', 'copy', out],
+        });
+      } else if (acc.audioRaw) {
+        relayLog('звук: вырезки SponsorBlock требуют перекодирования — сохраняю в MP3');
+      }
+      if (cover) {
+        runs.push({
+          out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3', phase: 'Кодирование MP3',
+          args: [...inA, '-i', cover, ...limit, ...af, '-map', '0:a', '-map', '1:v',
+            '-c:a', 'libmp3lame', '-b:a', '192k', '-c:v', 'copy',
+            '-disposition:v', 'attached_pic', '-id3v2_version', '3', 'out.mp3'],
+        });
+      }
       runs.push({
         out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3', phase: 'Кодирование MP3',
         args: [...inA, ...limit, '-vn', ...af, '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'],
@@ -349,6 +403,7 @@ async function finalize() {
   if (!data) {
     await assemble();
     if (!chosen && (votApplied || votTrack)) {
+      votError = 'сборка с переводом не удалась';
       const m = 'сборка с переводом не удалась — собираю без перевода';
       note('Перевод (VOT): ' + m);
       relayLog('VOT: ' + m + ' (' + lastErr.slice(0, 160) + ')');
@@ -364,6 +419,7 @@ async function finalize() {
   if (origAudio && origAudio.name !== aName) await rm(inst, origAudio.name);
   if (vName) await rm(inst, vName);
   await rm(inst, 'vot.mp3');
+  if (cover) await rm(inst, cover);
   acc.video = []; acc.audio = []; acc.sb = [];
 
   if (!chosen) throw new Error(lastErr || 'ffmpeg не собрал файл');
@@ -372,16 +428,22 @@ async function finalize() {
   relayLog('файл собран: ' + chosen.ext.slice(1) +
     (isMp3 ? '' : acc.transcode ? ', видео перекодировано в H.264' : ', потоки скопированы без перекодирования') +
     (acc.vot ? (votApplied || votTrack ? ', перевод встроен' : ', без перевода') : ''));
-  return saveBlob(data, acc.filename, chosen);
+  // Итог перевода уходит наверх, а не только в тост: раньше файл без перевода
+  // приходил во вкладку как обычный {ok:true} и в очереди значился «готово».
+  const filename = await saveBlob(data, acc.filename, chosen);
+  return { filename, votApplied: !!(votApplied || votTrack), votError };
 }
 
-async function saveBlob(data, baseName, chosen) {
+async function saveBlob(data, baseName, chosen, task) {
   const filename = (baseName || 'video').replace(/\.(mp4|webm|mp3)$/i, '') + chosen.ext;
   const blob = new Blob([data.buffer], { type: chosen.type });
   const url = URL.createObjectURL(blob);
   // fromRun: у этого сохранения есть запись в журнале запусков — background
-  // допишет туда шаги доставки (субтитры и сам журнал сохраняются без него)
-  const res = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename, fromRun: true });
+  // допишет туда шаги доставки (субтитры и сам журнал сохраняются без него).
+  // task: последнее слово об отмене за воркером — он знает состояние задания
+  // синхронно, а сюда par-drop мог ещё не доехать; иначе отменённая склейка
+  // всё равно скачивала файл и отправляла его получателю.
+  const res = await chrome.runtime.sendMessage({ t: 'ytdl-save', url, filename, fromRun: true, task });
   setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
   if (!res || !res.ok) throw new Error((res && res.error) || 'save failed');
   // Network uploads happen HERE, not in the background: the finished file already
@@ -398,7 +460,7 @@ function note(message) {
 // Веха для журнала запусков во время сборки: background ретранслирует её в
 // открытую вкладку, где runStep дописывает шаг в активный запуск.
 function relayLog(msg) {
-  try { chrome.runtime.sendMessage({ t: 'ytdl-run-log', msg }); } catch (e) {}
+  try { chrome.runtime.sendMessage({ t: 'ytdl-run-log', msg, job: curJob }); } catch (e) {}
 }
 
 // Веха после конца запуска (выгрузка готового файла): вкладка уже закрыла
@@ -499,6 +561,10 @@ async function parMerge(msg) {
   ffPhase = 'Сборка фрагментов';
   const state = par[msg.task];
   if (!state) throw new Error('нет данных задачи');
+  // Отмена во время склейки: par-drop только выкидывал задачу из par, а идущая
+  // сборка держала свою ссылку и досохраняла файл — он скачивался и уезжал
+  // получателю уже после того, как пользователь нажал «отменить».
+  const stop = () => { if (state.aborted) throw new Error('склейка отменена'); };
   const isMp3 = msg.format === 'mp3';
 
   const cuts = mergeCuts(msg.sb, msg.start, msg.end);
@@ -554,6 +620,7 @@ async function parMerge(msg) {
         args = ['-ss', String(Math.max(0, x - sV)), '-i', vN, '-ss', String(Math.max(0, x - sA)), '-i', aN,
           '-map', '0:v:0', '-map', '1:a:0', '-t', len, '-c', 'copy', out];
       }
+      stop();
       ffLog.length = 0;
       const ret = await inst.exec(args);
       if (ret !== 0) throw new Error('ffmpeg код ' + ret + ' (кусок ' + z.i + '): ' + ffLog.slice(-6).join(' | '));
@@ -582,6 +649,7 @@ async function parMerge(msg) {
 
   let data = null, chosen = null, lastErr = '';
   for (const run of attempts) {
+    stop();
     ffLog.length = 0;
     const ret = await inst.exec(run.args);
     if (ret === 0) {
@@ -599,7 +667,17 @@ async function parMerge(msg) {
   if (chosen) await rm(inst, chosen.out);
 
   if (!chosen) throw new Error(lastErr || 'склейка фрагментов не удалась');
-  return saveBlob(data, msg.filename, chosen);
+  stop();
+  return saveBlob(data, msg.filename, chosen, msg.task);
+}
+
+// Фрагмент отправителя — с проверкой номера попытки: данные от вкладки, которую
+// сторож уже признал зависшей, не должны попасть в буфер новой попытки.
+function frag(msg) {
+  const f = par[msg.task] && par[msg.task].frags[msg.idx];
+  if (!f) throw new Error('нет фрагмента ' + msg.idx);
+  if (f.att !== (msg.att || 0)) throw new Error('фрагмент ' + msg.idx + ' перевыдан другой вкладке');
+  return f;
 }
 
 // ---- message handlers ------------------------------------------------------
@@ -624,35 +702,49 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // ---- single mode ----
   if (msg.t === 'ytdl-begin') {
-    acc.video = []; acc.audio = [];
-    acc.videoMime = msg.videoMime || '';
-    acc.audioMime = msg.audioMime || '';
-    acc.filename = msg.filename || 'video.mp4';
-    acc.transcode = !!msg.transcode;
-    acc.format = msg.format || 'mp4';
-    acc.start = msg.start || 0;
-    acc.end = msg.end || 0;
-    acc.sb = Array.isArray(msg.sb) ? msg.sb : [];
-    // {videoId, mode, lang, srcLang, lively} — задание уже крутится в votJobs,
-    // параметры голоса нужны, чтобы найти именно его (см. votKey)
-    acc.vot = msg.vot || null;
+    // брошенные задания (вкладку закрыли посреди передачи) держали бы гигабайты
+    const now = Date.now();
+    for (const [k, a] of singles) if (now - a.ts > 30 * 60 * 1000) singles.delete(k);
+    singles.set(msg.job || '', {
+      job: msg.job || '', ts: now,
+      video: [], audio: [],
+      videoMime: msg.videoMime || '',
+      audioMime: msg.audioMime || '',
+      filename: msg.filename || 'video.mp4',
+      transcode: !!msg.transcode,
+      format: msg.format || 'mp4',
+      audioRaw: !!msg.audioRaw, // mp3-режим: копировать дорожку вместо кодирования
+      videoId: msg.videoId || '', // для обложки mp3
+      start: msg.start || 0,
+      end: msg.end || 0,
+      sb: Array.isArray(msg.sb) ? msg.sb : [],
+      // полная спецификация перевода, а не только ключ: offscreen могло
+      // пересоздать посреди передачи (OOM), и тогда votJobs пуст — по спецификации
+      // votAwait запустит перевод заново вместо «перевод не запускался»
+      vot: msg.vot || null,
+    });
     getFF().catch(() => {});
     sendResponse({ ok: true });
     return; // sync
   }
   if (msg.t === 'ytdl-chunk') {
     try {
-      acc[msg.track].push(b64decode(msg.b64));
+      const a = singles.get(msg.job || '');
+      if (!a) throw new Error('задание не найдено (offscreen перезапущен?)');
+      a[msg.track].push(b64decode(msg.b64));
+      a.ts = Date.now();
       sendResponse({ ok: true });
     } catch (e) {
-      sendResponse({ ok: false, error: String(e) });
+      sendResponse({ ok: false, error: String((e && e.message) || e) });
     }
     return; // sync
   }
   if (msg.t === 'ytdl-finalize') {
-    finalize()
-      .then((filename) => sendResponse({ ok: true, filename }))
-      .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+    const a = singles.get(msg.job || '');
+    if (!a) { sendResponse({ ok: false, error: 'задание не найдено (offscreen перезапущен?)' }); return; }
+    ffLock(a.job, () => finalize(a))
+      .then((r) => { singles.delete(a.job); sendResponse(Object.assign({ ok: true }, r)); })
+      .catch((e) => { singles.delete(a.job); sendResponse({ ok: false, error: String((e && e.message) || e) }); });
     return true; // async
   }
 
@@ -667,6 +759,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     st.frags[msg.idx] = {
       video: [], audio: [], aName: null, vName: null,
       videoMime: msg.videoMime || '', audioMime: msg.audioMime || '',
+      // номер попытки хранится и здесь: зависшая вкладка живёт ещё минуты и
+      // досылает свои чанки, а по task+idx они попадали прямо в буфер новой
+      // попытки — воркер отвергал её frag-done уже после порчи данных
+      att: msg.att || 0,
+      // имя файла в FS ffmpeg — с заданием и номером попытки: 'fa0.webm' был
+      // общим на все задания, и вторая параллельная загрузка затирала первой
+      // её же фрагмент (или удаляла ещё нужный вход)
+      tag: msg.task + '_' + msg.idx + '_' + (msg.att || 0),
     };
     getFF().catch(() => {});
     sendResponse({ ok: true });
@@ -674,8 +774,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.t === 'ytdl-par-chunk') {
     try {
-      const f = par[msg.task] && par[msg.task].frags[msg.idx];
-      if (!f) throw new Error('нет фрагмента ' + msg.idx);
+      const f = frag(msg);
       f[msg.track].push(b64decode(msg.b64));
       sendResponse({ ok: true });
     } catch (e) {
@@ -688,16 +787,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // buffers: with 4 workers in flight, holding every fragment as JS arrays AND
     // as an ffmpeg copy is what pushes the wasm heap over its ~2 GB ceiling.
     (async () => {
-      const f = par[msg.task] && par[msg.task].frags[msg.idx];
-      if (!f) throw new Error('нет фрагмента ' + msg.idx);
+      const f = frag(msg);
       const inst = await getFF();
       const aB = concat(f.audio); f.audio = [];
       const vB = f.video.length ? concat(f.video) : null; f.video = [];
       if (!aB.length) throw new Error('пустое аудио фрагмента ' + msg.idx);
-      f.aName = 'fa' + msg.idx + '.' + extFor(f.audioMime);
+      f.aName = 'fa' + f.tag + '.' + extFor(f.audioMime);
       await inst.writeFile(f.aName, aB);
       if (vB) {
-        f.vName = 'fv' + msg.idx + '.' + extFor(f.videoMime);
+        f.vName = 'fv' + f.tag + '.' + extFor(f.videoMime);
         await inst.writeFile(f.vName, vB);
       }
       return { ok: true };
@@ -708,6 +806,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.t === 'ytdl-par-drop') {
     const st = par[msg.task];
+    if (st) st.aborted = true; // идущая склейка держит свою ссылку и увидит флаг
     delete par[msg.task];
     sendResponse({ ok: true });
     if (st && ff) {
@@ -721,9 +820,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg.t === 'ytdl-par-merge') {
     sendResponse({ ok: true }); // ack now; the result arrives as 'ytdl-par-merged'
-    parMerge(msg)
-      .then((filename) => chrome.runtime.sendMessage({ t: 'ytdl-par-merged', task: msg.task, ok: true, filename }))
-      .catch((e) => chrome.runtime.sendMessage({ t: 'ytdl-par-merged', task: msg.task, ok: false, error: String((e && e.message) || e) }))
+    ffLock(msg.task, () => parMerge(msg))
+      .then((filename) => chrome.runtime.sendMessage({ t: 'ytdl-par-merged', task: msg.task, mergeId: msg.mergeId, ok: true, filename }))
+      .catch((e) => chrome.runtime.sendMessage({ t: 'ytdl-par-merged', task: msg.task, mergeId: msg.mergeId, ok: false, error: String((e && e.message) || e) }))
       .finally(() => { delete par[msg.task]; });
     return; // sync (ack already sent)
   }

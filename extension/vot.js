@@ -180,23 +180,29 @@ async function votFakeAudio(url, translationId) {
   if (!res.ok) throw votHttpError('audio-запрос', res.status);
 }
 
-function votNote(text) {
-  try { chrome.runtime.sendMessage({ t: 'ytdl-vot-status', text }); } catch (e) {}
+// job — чьё это задание: воркер ретранслирует статус только в ту вкладку,
+// которая его запустила (иначе вторая загрузка перехватывала чужие сообщения)
+function votNote(text, job) {
+  try { chrome.runtime.sendMessage({ t: 'ytdl-vot-status', text, job }); } catch (e) {}
 }
 
 const votSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function votRun(o) {
+  const say = (t) => votNote(t, o.job);
   const srcLang = o.srcLang && o.srcLang !== 'auto' ? o.srcLang : 'auto';
   // живой голос: только на русский и только с токеном; при «авто» источнике
   // Яндекс требует конкретный язык — юзерскрипт в этом случае шлёт en
   let lively = !!o.lively && o.lang === 'ru' && !!o.token;
   let audioSent = false;
   let polls = 0;
-  const deadline = Date.now() + 60 * 60 * 1000;
+  // главный ручной сценарий зависания (исходный язык явно равен целевому)
+  // отсекается заранее в content_ui.js; этот дедлайн — страховка на случай,
+  // если Яндекс всё равно застрянет в WAITING по другой причине
+  const deadline = Date.now() + 15 * 60 * 1000;
 
   while (true) {
-    if (Date.now() > deadline) throw new Error('перевод не успел подготовиться за час');
+    if (Date.now() > deadline) throw new Error('перевод не успел подготовиться за 15 минут');
     const body = votEncodeTranslate({
       url: o.url,
       duration: o.duration,
@@ -218,7 +224,7 @@ async function votRun(o) {
     if (status === 1 || (status === 5 && f[1])) {
       const url = votUtf8(f[1]);
       if (!url) throw new Error('Яндекс не вернул ссылку на аудио');
-      votNote('скачиваю переведённую дорожку…');
+      say('скачиваю переведённую дорожку…');
       // S3 Яндекса отдаёт файл обычным GET без подписи; через ретранслятор — по
       // его же пути audio-proxy, иначе скачивание упрётся в ту же блокировку
       const src = votProxyHost && url.startsWith(VOT_AUDIO_PREFIX)
@@ -231,7 +237,7 @@ async function votRun(o) {
     if (status === 0) {
       if (lively && /обычная озвучка/i.test(message)) {
         lively = false;
-        votNote('живой голос недоступен — пробую обычный');
+        say('живой голос недоступен — пробую обычный');
         continue;
       }
       throw new Error('Яндекс не смог перевести видео' + (message ? ': ' + message : ''));
@@ -249,7 +255,7 @@ async function votRun(o) {
 
     // 2 WAITING / 3 LONG_WAITING: ждём и повторяем тот же запрос
     const eta = Number(f[5]) || 0;
-    votNote('Яндекс переводит…' + (eta > 0 ? ' осталось ~' + Math.max(1, Math.round(eta / 60)) + ' мин' : ''));
+    say('Яндекс переводит…' + (eta > 0 ? ' осталось ~' + Math.max(1, Math.round(eta / 60)) + ' мин' : ''));
     const delayS = polls === 0 ? (eta > 0 ? Math.min(eta, 180) : 120) : 30;
     polls++;
     await votSleep(delayS * 1000);
@@ -280,7 +286,7 @@ function votStart(o) {
     const job = { p: votRun(o), failed: false };
     job.p.catch((e) => {
       job.failed = true; // сорванное задание не переиспользуем при новом запуске
-      votNote('ошибка: ' + String((e && e.message) || e));
+      votNote('ошибка: ' + String((e && e.message) || e), o.job);
     });
     votJobs.set(key, job);
     j = job;
@@ -290,8 +296,12 @@ function votStart(o) {
 
 // Каждому вызову — своя копия: ffmpeg.writeFile забирает буфер как transferable
 // и обнуляет исходный, а задание переживает повторные попытки сборки файла.
+// Offscreen-документ мог быть пересоздан посреди передачи данных (обычно OOM на
+// длинном видео) — тогда votJobs пуст, и перевод молча пропадал. Спецификация
+// задания приходит вместе с ytdl-begin целиком, поэтому его просто запускаем
+// заново; при живом документе votStart идемпотентен и вернёт то же задание.
 function votAwait(o) {
-  const j = votJobs.get(votKey(o));
+  const j = votJobs.get(votKey(o)) || (o && o.url ? { p: votStart(o) } : null);
   if (!j) return Promise.reject(new Error('перевод не запускался'));
   return j.p.then((bytes) => bytes.slice());
 }

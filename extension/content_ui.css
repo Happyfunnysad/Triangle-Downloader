@@ -47,6 +47,17 @@
 }
 .ytdl-gear svg { width: 16px; height: 16px; }
 .ytdl-gear:hover { background: rgba(255,255,255,.12); color: #fff; }
+/* очередь стоит слева от шестерёнки — «прижимает» вправо уже она */
+.ytdl-qbtn { position: relative; }
+.ytdl-qbtn + .ytdl-gear { margin-left: 0; }
+.ytdl-qbadge {
+  position: absolute; top: 2px; right: 1px;
+  min-width: 14px; height: 14px; padding: 0 3px;
+  box-sizing: border-box; border-radius: 999px;
+  background: #ff4e45; color: #fff;
+  font-size: 9.5px; font-style: normal; font-weight: 700; line-height: 14px;
+  text-align: center;
+}
 
 .ytdl-pane { display: flex; flex-direction: column; gap: 14px; }
 
@@ -263,6 +274,87 @@
 }
 .ytdl-pbtn-danger:hover { background: rgba(255,78,69,.16); }
 
+/* ── панель очереди ──────────────────────────────────────────────────────── */
+/* Слева внизу, чтобы не спорить за место с тостом и панелью параллельной
+   загрузки — те обе живут справа внизу. */
+#ytdl-queue {
+  position: fixed;
+  left: 20px; bottom: 20px;
+  z-index: 2147483647;
+  width: 320px;
+  max-height: min(60vh, 460px);
+  display: flex; flex-direction: column; gap: 10px;
+  background: rgba(24,24,24,.98);
+  color: #fff;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 14px;
+  padding: 14px;
+  font-family: "YouTube Sans", Roboto, Arial, sans-serif;
+  font-size: 13px;
+  box-shadow: 0 12px 36px rgba(0,0,0,.6);
+  animation: ytdl-in .16s ease-out;
+}
+#ytdl-queue .ytdl-q-head { display: flex; align-items: center; gap: 8px; }
+#ytdl-queue .ytdl-q-head svg { width: 13px; height: 13px; display: block; }
+#ytdl-queue .ytdl-q-title { font-size: 12px; color: #9aa0a6; }
+#ytdl-queue .ytdl-q-clear {
+  margin-left: auto;
+  background: transparent; border: 0; padding: 0;
+  color: #6f7378; font: inherit; font-size: 11px; cursor: pointer;
+}
+#ytdl-queue .ytdl-q-clear:hover { color: #fff; }
+#ytdl-queue .ytdl-q-close {
+  width: 20px; height: 20px; display: grid; place-items: center;
+  background: transparent; border: 0; border-radius: 6px;
+  color: #6f7378; font: inherit; font-size: 12px; cursor: pointer;
+}
+#ytdl-queue .ytdl-q-close:hover { background: rgba(255,255,255,.12); color: #fff; }
+#ytdl-queue .ytdl-q-list {
+  display: flex; flex-direction: column; gap: 10px;
+  overflow-y: auto; margin: 0 -4px; padding: 0 4px;
+}
+#ytdl-queue .ytdl-q-empty { color: #6f7378; font-size: 11.5px; padding: 4px 0; }
+.ytdl-q-row { display: flex; flex-direction: column; gap: 5px; }
+.ytdl-q-row.fin { opacity: .62; }
+.ytdl-q-top { display: flex; align-items: center; gap: 7px; }
+.ytdl-q-tag {
+  flex: none;
+  padding: 2px 6px; border-radius: 999px;
+  background: rgba(255,255,255,.11); color: #cfd2d5;
+  font-size: 9.5px; font-style: normal; font-weight: 700; letter-spacing: .03em;
+}
+.ytdl-q-name {
+  flex: 1; min-width: 0;
+  font-size: 12.5px; color: #e6e6e6;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ytdl-q-st { flex: none; font-size: 11px; color: #9aa0a6; }
+.ytdl-q-st-done { color: #3dba54; }
+.ytdl-q-st-error, .ytdl-q-st-stall { color: #ff6b63; }
+.ytdl-q-st-merge { color: #e8a33d; }
+.ytdl-q-x {
+  flex: none;
+  width: 18px; height: 18px; display: grid; place-items: center;
+  background: transparent; border: 0; border-radius: 5px;
+  color: #6f7378; font: inherit; font-size: 11px; cursor: pointer;
+}
+.ytdl-q-x:hover { background: rgba(255,78,69,.16); color: #ff6b63; }
+.ytdl-q-re {
+  flex: none;
+  width: 18px; height: 18px; display: grid; place-items: center;
+  background: transparent; border: 0; border-radius: 5px;
+  color: #9aa0a6; font: inherit; font-size: 12px; cursor: pointer;
+}
+.ytdl-q-re:hover { background: rgba(255,255,255,.14); color: #fff; }
+.ytdl-q-re:disabled { color: #4a4d50; cursor: default; background: transparent; }
+.ytdl-q-warn { font-size: 11px; color: #e8a33d; line-height: 1.35; }
+.ytdl-q-bar { height: 4px; border-radius: 3px; background: rgba(255,255,255,.14); overflow: hidden; }
+.ytdl-q-bar i { display: block; height: 100%; width: 0%; background: #ff4e45; transition: width .2s; }
+.ytdl-q-note {
+  font-size: 11px; color: #6f7378; line-height: 1.35;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
 /* ── progress toast ──────────────────────────────────────────────────────── */
 #ytdl-toast {
   position: fixed;
@@ -282,7 +374,8 @@
   transition: opacity .2s, transform .2s;
   pointer-events: none;
 }
-#ytdl-toast.show { opacity: 1; transform: translateY(0); }
+/* видимый тост должен ловить клики: в нём живёт кнопка «Скопировать отчёт» */
+#ytdl-toast.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
 #ytdl-toast .ytdl-toast-head { display: flex; align-items: center; gap: 8px; }
 #ytdl-toast .ytdl-toast-head svg { width: 13px; height: 13px; display: block; }
 #ytdl-toast .ytdl-toast-name { font-size: 12px; color: #9aa0a6; }
