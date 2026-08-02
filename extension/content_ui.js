@@ -2224,6 +2224,9 @@
       if (f.st === 'done') done++; else if (f.st === 'run') run++; else if (f.st === 'err') err++;
       const p = f.st === 'done' ? 1 : (f.st === 'run' ? Math.max(0, Math.min(1, f.pct || 0)) : 0);
       const range = f.e != null ? fmtShort(f.s) + ' – ' + fmtShort(f.e) : '';
+      const nowAt = (f.st === 'run' && f.s != null && f.e != null)
+        ? f.s + (f.e - f.s) * p : null;
+      const nowTxt = nowAt != null ? 'сейчас ' + fmtShort(nowAt) : '';
 
       const seg = el('span', 'ytdl-p-seg ytdl-p-seg-' + f.st);
       seg.style.width = (span > 0 ? ((f.e - f.s) / span) * 100 : 100 / (frags.length || 1)) + '%';
@@ -2231,6 +2234,7 @@
       fill.style.width = Math.round(p * 100) + '%';
       seg.appendChild(fill);
       seg.title = '#' + (f.idx + 1) + (range ? ' · ' + range : '') + ' · ' +
+        (nowTxt ? nowTxt + ' · ' : '') +
         (F_STATE[f.st] || f.st) + (f.st === 'run' ? ' ' + Math.round(p * 100) + '%' : '') +
         (f.err ? ' · ' + f.err : '');
       ui.line.appendChild(seg);
@@ -2239,6 +2243,7 @@
       const top = el('div', 'ytdl-p-frag-top');
       top.appendChild(el('i', 'ytdl-p-frag-i', String(f.idx + 1)));
       if (range) top.appendChild(el('span', 'ytdl-p-frag-t', range));
+      if (nowTxt) top.appendChild(el('span', 'ytdl-p-frag-now', nowTxt));
       top.appendChild(el('span', 'ytdl-p-frag-st ' + f.st,
         (F_STATE[f.st] || f.st) +
         (f.st === 'run' ? ' · ' + Math.round(p * 100) + '%' : '') +

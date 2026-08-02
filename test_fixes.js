@@ -247,6 +247,17 @@ function testWebmCopyDoesNotTryMp4First() {
     'параллельная склейка без перекодирования снова может попробовать MP4 перед WebM');
 }
 
+function testParallelShowsCurrentFragmentTime() {
+  const src = fs.readFileSync(path.join(__dirname, 'extension', 'content_ui.js'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, 'extension', 'content_ui.css'), 'utf8');
+  assert.ok(src.includes("const nowTxt = nowAt != null ? 'сейчас ' + fmtShort(nowAt) : '';"),
+    'панель фрагментов не считает текущее время внутри активного отрезка');
+  assert.ok(src.includes("el('span', 'ytdl-p-frag-now', nowTxt)"),
+    'текущее время активного отрезка не выводится в строку фрагмента');
+  assert.ok(css.includes('.ytdl-p-frag-now'),
+    'для текущего времени фрагмента нет отдельного компактного стиля');
+}
+
 (async () => {
   await testBackground();
   await testOffscreen();
@@ -254,6 +265,7 @@ function testWebmCopyDoesNotTryMp4First() {
   testParallelExtrasDoNotForceSingleTab();
   testDestReadinessIsShared();
   testWebmCopyDoesNotTryMp4First();
+  testParallelShowsCurrentFragmentTime();
   console.log('все проверки прошли');
   process.exit(0); // код расширения оставляет свои долгие таймеры — они тут ни к чему
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -460,6 +460,14 @@
   font-variant-numeric: tabular-nums;
 }
 .ytdl-p-frag-t { flex: none; color: #cfd2d5; font-variant-numeric: tabular-nums; }
+.ytdl-p-frag-now {
+  min-width: 0;
+  color: #e8a33d;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .ytdl-p-frag-st { margin-left: auto; flex: none; color: #9aa0a6; }
 .ytdl-p-frag-st.run  { color: #e8a33d; }
 .ytdl-p-frag-st.done { color: #3dba54; }
