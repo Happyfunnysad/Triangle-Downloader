@@ -669,10 +669,17 @@ async function parMerge(msg) {
           '-map', '0:v:0', '-map', '1:a:0', '-t', len,
           '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
           '-c:a', 'aac', '-b:a', '160k', out];
-      } else {
+      } else if (mp4CopyInput(vN) && mp4CopyInput(aN)) {
+        out = 'p' + z.i + '.mp4';
+        args = ['-ss', String(Math.max(0, x - sV)), '-i', vN, '-ss', String(Math.max(0, x - sA)), '-i', aN,
+          '-map', '0:v:0', '-map', '1:a:0', '-t', len, '-c', 'copy', '-strict', '-2', out];
+      } else if (webmCopyInput(vN) && webmCopyInput(aN)) {
         out = 'p' + z.i + '.webm';
         args = ['-ss', String(Math.max(0, x - sV)), '-i', vN, '-ss', String(Math.max(0, x - sA)), '-i', aN,
           '-map', '0:v:0', '-map', '1:a:0', '-t', len, '-c', 'copy', out];
+      } else {
+        throw new Error('нельзя собрать кусок ' + z.i +
+          ' без перекодирования: контейнеры видео и аудио несовместимы');
       }
       stop();
       ffLog.length = 0;
@@ -688,14 +695,21 @@ async function parMerge(msg) {
 
   // final concat in piece order
   await inst.writeFile('list.txt', new TextEncoder().encode(pieceNames.map((p) => "file '" + p + "'").join('\n')));
+  const allMp4Pieces = pieceNames.length && pieceNames.every(mp4CopyInput);
+  const allWebmPieces = pieceNames.length && pieceNames.every(webmCopyInput);
   const attempts = isMp3
     ? [{ out: 'out.mp3', type: 'audio/mpeg', ext: '.mp3',
          args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-vn', '-c:a', 'libmp3lame', '-b:a', '192k', 'out.mp3'] }]
     : msg.transcode
       ? [{ out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
            args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-movflags', '+faststart', 'out.mp4'] }]
-      : [{ out: 'out.webm', type: 'video/webm', ext: '.webm',
-           args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'out.webm'] }];
+      : allMp4Pieces
+        ? [{ out: 'out.mp4', type: 'video/mp4', ext: '.mp4',
+             args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', '-strict', '-2', '-movflags', '+faststart', 'out.mp4'] }]
+        : allWebmPieces
+          ? [{ out: 'out.webm', type: 'video/webm', ext: '.webm',
+               args: ['-f', 'concat', '-safe', '0', '-i', 'list.txt', '-c', 'copy', 'out.webm'] }]
+          : [];
 
   let data = null, chosen = null, lastErr = '';
   for (const run of attempts) {
@@ -716,7 +730,7 @@ async function parMerge(msg) {
   await rm(inst, 'list.txt');
   if (chosen) await rm(inst, chosen.out);
 
-  if (!chosen) throw new Error(lastErr || 'склейка фрагментов не удалась');
+  if (!chosen) throw new Error(lastErr || 'склейка фрагментов без перекодирования не удалась');
   stop();
   return saveBlob(data, msg.filename, chosen, msg.task);
 }

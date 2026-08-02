@@ -243,8 +243,14 @@ function testWebmCopyDoesNotTryMp4First() {
     'MP4 copy не проверяет совместимость входных потоков');
   assert.ok(src.includes('webmCopyInput(vName) && webmCopyInput(aName)'),
     'WebM copy не проверяет совместимость входных потоков');
-  assert.ok(src.includes(": [{ out: 'out.webm', type: 'video/webm', ext: '.webm',"),
-    'параллельная склейка без перекодирования снова может попробовать MP4 перед WebM');
+  assert.ok(src.includes('mp4CopyInput(vN) && mp4CopyInput(aN)'),
+    'параллельный кусок MP4/M4A снова может собираться в WebM');
+  assert.ok(src.includes('webmCopyInput(vN) && webmCopyInput(aN)'),
+    'параллельный кусок WebM снова может собираться в MP4');
+  assert.ok(src.includes('const allMp4Pieces = pieceNames.length && pieceNames.every(mp4CopyInput);'),
+    'финальная параллельная склейка не выбирает MP4 по готовым кускам');
+  assert.ok(src.includes('const allWebmPieces = pieceNames.length && pieceNames.every(webmCopyInput);'),
+    'финальная параллельная склейка не выбирает WebM по готовым кускам');
 }
 
 function testParallelShowsCurrentFragmentTime() {
