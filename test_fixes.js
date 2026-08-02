@@ -214,14 +214,14 @@ function testSubsAndChapters() {
   assert.ok(!/[=;]/.test(meta.split('title=')[2]), 'в заголовке главы остались символы разметки ffmetadata');
 }
 
-function testParallelKeepsMediaExtras() {
+function testParallelExtrasDoNotForceSingleTab() {
   const src = fs.readFileSync(path.join(__dirname, 'extension', 'content_ui.js'), 'utf8');
-  assert.ok(src.includes("const wantsMediaExtras = !isMp3 && (subsIn !== 'off' || chapsIn);"),
-    'нет флага, который отличает полный файл с субтитрами/главами от быстрого параллельного пути');
-  assert.ok(/if \(!vot && !wantsMediaExtras && parEligible\)/.test(src),
-    'параллельный путь снова может пропустить включённые субтитры или главы');
-  assert.ok(src.includes('subsIn, chapsIn'),
-    'очередь не сохраняет выбранные субтитры/главы для честного предупреждения при повторе');
+  assert.ok(src.includes("const dropsMediaExtras = !isMp3 && (subsIn !== 'off' || chapsIn);"),
+    'нет флага, который предупреждает о невшитых субтитрах/главах в параллельном пути');
+  assert.ok(/if \(!vot && parEligible\)/.test(src),
+    'включённые субтитры или главы снова могут принудительно отправить загрузку в одну вкладку');
+  assert.ok(src.includes('subsIn: opts.subsIn') && src.includes('chapsIn: !!opts.chapsIn'),
+    'параллельный старт не сохраняет выбранные субтитры/главы для честного предупреждения при повторе');
 
   const bg = fs.readFileSync(path.join(__dirname, 'extension', 'background.js'), 'utf8');
   assert.ok(bg.includes("if (item.spec.subsIn && item.spec.subsIn !== 'off') lost.push('субтитры');"),
@@ -251,7 +251,7 @@ function testWebmCopyDoesNotTryMp4First() {
   await testBackground();
   await testOffscreen();
   testSubsAndChapters();
-  testParallelKeepsMediaExtras();
+  testParallelExtrasDoNotForceSingleTab();
   testDestReadinessIsShared();
   testWebmCopyDoesNotTryMp4First();
   console.log('все проверки прошли');

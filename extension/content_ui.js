@@ -1828,26 +1828,27 @@
       }
     }
     const parEligible = planned > 1 && range >= (Number(parChunk) || 12) * 60 * 1.5;
-    const wantsMediaExtras = !isMp3 && (subsIn !== 'off' || chapsIn);
+    const dropsMediaExtras = !isMp3 && (subsIn !== 'off' || chapsIn);
     if (vot && parEligible) {
       // перевод собирается в finalize одной вкладки — параллельный путь его не умеет;
       // без этой записи в журнале выглядело так, будто настройка вкладок игнорируется
       runStep('VOT: параллельный режим отключён, качаю в одной вкладке' +
         ' (без перевода вкладок было бы ' + planned + ')');
     }
-    if (!vot && wantsMediaExtras && parEligible) {
+    if (!vot && dropsMediaExtras && parEligible) {
       // параллельный путь собирает фрагменты в worker/offscreen без доступа к
-      // расшифровке страницы и главам из info. Если пользователь включил эти
-      // опции, важнее отдать полный файл, чем выиграть скорость на вкладках.
-      runStep('субтитры/главы: параллельный режим отключён, качаю в одной вкладке' +
-        ' (без них вкладок было бы ' + planned + ')');
+      // расшифровке страницы и главам из info. Не ломаем явный выбор вкладок,
+      // но честно пишем в журнал, что эти дополнения в параллельной сборке теряются.
+      runStep('субтитры/главы: параллельный режим включён на ' + planned +
+        ' вкладках; в этом режиме они не вшиваются');
     }
-    if (!vot && !wantsMediaExtras && parEligible) {
+    if (!vot && parEligible) {
       t.hide(0);
       runStep('параллельный режим: вкладок ' + planned + ', кусок ' + parChunk + ' мин');
       return startParallel({
         format, height, start, end, transcode: doTranscode,
         sb: sbSegments, parTabs, parChunk, label, dest: ctx.dest,
+        subsIn, chapsIn,
       }, info);
     }
 
@@ -2050,6 +2051,7 @@
         height: opts.height, format: opts.format, transcode: opts.transcode,
         start: opts.start, end: opts.end, sb: opts.sb,
         tabsMode: String(opts.parTabs), chunkMin: Number(opts.parChunk) || 12,
+        subsIn: opts.subsIn || 'off', chapsIn: !!opts.chapsIn,
         // для очереди: воркер сам заводит запись, но подписать её может только вкладка
         name: info.title || 'видео', label: opts.label || '', dest: opts.dest || 'local',
       });
