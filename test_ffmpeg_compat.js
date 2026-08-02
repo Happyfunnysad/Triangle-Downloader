@@ -53,7 +53,7 @@ async function main() {
 
   assert.strictEqual(ret, 0, 'совместимый повтор не вернул успешный код');
   assert.strictEqual(calls.length, 2, 'команда WebM не была повторена ровно один раз');
-  assert.deepStrictEqual(calls[1].slice(-3), ['-fflags', '-autobsf', 'piece.webm']);
+  assert.deepStrictEqual(Array.from(calls[1].slice(-3)), ['-fflags', '-autobsf', 'piece.webm']);
   assert.deepStrictEqual(removed, ['piece.webm'], 'частичный WebM не удалён перед повтором');
   assert.ok(relayed.some((s) => /без autobsf/.test(s)), 'fallback не попал в журнал запуска');
 
