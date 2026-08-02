@@ -181,9 +181,68 @@ async function testOffscreen() {
   assert.strictEqual(orphanFin.ok, false);
 }
 
+// srtFrom/chaptersMeta живут в замыкании content_ui.js и наружу не торчат —
+// вырезаем их блок из настоящего файла и выполняем, чтобы проверять именно его.
+function subsHelpers() {
+  const src = fs.readFileSync(path.join(__dirname, 'extension', 'content_ui.js'), 'utf8');
+  const from = src.indexOf('  function srtStamp(');
+  const to = src.indexOf('  async function downloadSubtitles(');
+  assert.ok(from > 0 && to > from, 'блок сборки субтитров не найден в content_ui.js');
+  return new Function(src.slice(from, to) + '\nreturn { srtFrom, chaptersMeta };')();
+}
+
+function testSubsAndChapters() {
+  const { srtFrom, chaptersMeta } = subsHelpers();
+
+  // диапазон 4..12: реплики сдвигаются к нулю файла и обрезаются по краям
+  const srt = srtFrom([{ t: 0, text: 'a' }, { t: 5, text: 'b' }, { t: 10, text: 'c' }], 4, 12);
+  assert.strictEqual(srt.split('-->').length - 1, 3, 'не столько реплик, сколько ожидалось');
+  assert.ok(srt.startsWith('1\n00:00:00,000 --> 00:00:01,000\na'), 'реплики не сдвинуты к началу файла:\n' + srt);
+  assert.ok(/00:00:08,000\nc/.test(srt), 'последняя реплика не обрезана по концу диапазона:\n' + srt);
+
+  // реплика без времени бесполезна для .srt и не должна ломать нумерацию
+  assert.strictEqual(srtFrom([{ t: null, text: 'x' }], 0, 10), '');
+  assert.strictEqual(srtFrom([], 0, 10), '');
+
+  // главы: одна глава — это не разметка; конец берётся от следующей и режется по диапазону
+  assert.strictEqual(chaptersMeta([{ t: 0, title: 'Одна' }], 0, 120), '');
+  const meta = chaptersMeta(
+    [{ t: 0, title: 'Вступ' }, { t: 60, title: 'Сут=ь;' }, { t: 600, title: 'Финал' }], 0, 120);
+  assert.ok(meta.startsWith(';FFMETADATA1'), 'нет заголовка ffmetadata');
+  assert.strictEqual((meta.match(/\[CHAPTER\]/g) || []).length, 2, 'глава вне диапазона не отброшена');
+  assert.ok(/END=120000/.test(meta), 'конец последней главы не обрезан по диапазону:\n' + meta);
+  assert.ok(!/[=;]/.test(meta.split('title=')[2]), 'в заголовке главы остались символы разметки ffmetadata');
+}
+
+function testParallelKeepsMediaExtras() {
+  const src = fs.readFileSync(path.join(__dirname, 'extension', 'content_ui.js'), 'utf8');
+  assert.ok(src.includes("const wantsMediaExtras = !isMp3 && (subsIn !== 'off' || chapsIn);"),
+    'нет флага, который отличает полный файл с субтитрами/главами от быстрого параллельного пути');
+  assert.ok(/if \(!vot && !wantsMediaExtras && parEligible\)/.test(src),
+    'параллельный путь снова может пропустить включённые субтитры или главы');
+  assert.ok(src.includes('subsIn, chapsIn'),
+    'очередь не сохраняет выбранные субтитры/главы для честного предупреждения при повторе');
+
+  const bg = fs.readFileSync(path.join(__dirname, 'extension', 'background.js'), 'utf8');
+  assert.ok(bg.includes("if (item.spec.subsIn && item.spec.subsIn !== 'off') lost.push('субтитры');"),
+    'повтор из очереди не предупреждает о потере субтитров');
+  assert.ok(bg.includes("if (item.spec.chapsIn) lost.push('главы');"),
+    'повтор из очереди не предупреждает о потере глав');
+}
+
+function testDestReadinessIsShared() {
+  const src = fs.readFileSync(path.join(__dirname, 'extension', 'content_ui.js'), 'utf8');
+  assert.ok(src.includes('function destReady(kind)'), 'нет общего правила готовности получателей');
+  assert.ok(src.includes("if (destReady('ftp'))"), 'FTP-пилюля может появиться без готового помощника');
+  assert.ok(src.includes("set('ftp', destReady('ftp')"), 'FTP-карточка проверяется не тем же правилом, что пилюля');
+}
+
 (async () => {
   await testBackground();
   await testOffscreen();
+  testSubsAndChapters();
+  testParallelKeepsMediaExtras();
+  testDestReadinessIsShared();
   console.log('все проверки прошли');
   process.exit(0); // код расширения оставляет свои долгие таймеры — они тут ни к чему
 })().catch((e) => { console.error(e); process.exit(1); });

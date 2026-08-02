@@ -140,6 +140,8 @@ function specOf(msg) {
     tabsMode: String(msg.tabsMode == null ? 'auto' : msg.tabsMode),
     chunkMin: Number(msg.chunkMin) || 12,
     vot: !!msg.vot,
+    subsIn: msg.subsIn || 'off',
+    chapsIn: !!msg.chapsIn,
   };
 }
 
@@ -732,9 +734,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const elapsed = (Date.now() - job.startedAt) / 1000;
     sendResponse({
       ok: true, state: job.state, error: job.error, filename: job.filename,
-      workers: job.tabs.size, mergePct: job.mergePct || 0, progress: pct,
+      workers: job.tabs.size, plan: job.workers, mergePct: job.mergePct || 0, progress: pct,
       eta: pct > 0.03 && job.state === 'run' ? Math.round(elapsed * (1 - pct) / pct) : null,
-      frags: job.frags.map((f) => ({ idx: f.idx, st: f.st, pct: f.pct })),
+      // границы куска, число попыток и причина отказа — панель рисует по ним
+      // ленту в пропорции длины фрагментов и объясняет, что именно сломалось
+      frags: job.frags.map((f) => ({
+        idx: f.idx, st: f.st, pct: f.pct, s: f.s, e: f.e,
+        tries: f.tries || 0, err: f.err || null,
+      })),
     });
     return;
   }
@@ -848,8 +855,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             item.error = null;
             item.finishedAt = null;
             item.note = 'повтор запущен';
-            // повтор идёт через параллельную сборку, а она перевод не умеет
-            item.warn = item.spec.vot ? 'перевод VOT при повторе не переносится' : '';
+            // повтор идёт через параллельную сборку: она не видит страницу с
+            // расшифровкой/главами и не умеет восстановить VOT-дорожку
+            const lost = [];
+            if (item.spec.vot) lost.push('перевод VOT');
+            if (item.spec.subsIn && item.spec.subsIn !== 'off') lost.push('субтитры');
+            if (item.spec.chapsIn) lost.push('главы');
+            item.warn = lost.length ? lost.join(', ') + ' при повторе не переносятся' : '';
             spawnTabs(fresh);
           } else {
             item.warn = 'повторить нечем: параметры загрузки не сохранились';

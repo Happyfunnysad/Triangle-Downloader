@@ -84,6 +84,42 @@ function extFor(mime) {
 }
 async function rm(inst, name) { try { await inst.deleteFile(name); } catch (e) {} }
 
+// Главы и субтитры вшиваются ОТДЕЛЬНЫМ проходом с копированием потоков. Так они
+// не вмешиваются в раскладку входов основной сборки (видео, аудио, дорожка
+// перевода) — а это как раз то место, где легко всё сломать. Проход не удался —
+// возвращаем исходный файл: главы приятны, но не ради них всё затевалось.
+async function decorate(inst, name, ext, srt, chapters) {
+  if (ext !== '.mp4' || (!srt && !chapters)) return name;
+  const ins = ['-i', name];
+  const maps = ['-map', '0'];
+  const enc = new TextEncoder();
+  let idx = 1, meta = [], subCodec = [];
+  if (srt) {
+    await inst.writeFile('subs.srt', enc.encode(srt));
+    ins.push('-i', 'subs.srt');
+    maps.push('-map', String(idx));
+    subCodec = ['-c:s', 'mov_text'];
+    idx++;
+  }
+  if (chapters) {
+    await inst.writeFile('chaps.txt', enc.encode(chapters));
+    ins.push('-i', 'chaps.txt');
+    meta = ['-map_metadata', String(idx), '-map_chapters', String(idx)];
+    idx++;
+  }
+  ffPhase = 'Главы и субтитры';
+  ffLog.length = 0;
+  const out = 'deco.mp4';
+  const ret = await inst.exec([...ins, ...maps, ...meta, '-c', 'copy', ...subCodec,
+    '-movflags', '+faststart', out]);
+  await rm(inst, 'subs.srt');
+  await rm(inst, 'chaps.txt');
+  if (ret === 0) return out;
+  await rm(inst, out);
+  relayLog('главы/субтитры вшить не удалось (' + ffLog.slice(-2).join(' | ').slice(0, 120) + ') — файл без них');
+  return name;
+}
+
 // Real start timestamp of a captured file (mid-video captures start at ~capStart).
 // `ffmpeg -i file` exits with an error but prints "Duration: ..., start: X" first.
 async function probeStart(inst, name) {
@@ -246,9 +282,11 @@ async function finalize(acc) {
         // дорожка перевода начинается с t=0 видео → сик абсолютным start
         const seekVot = start > 0.2 ? ['-ss', String(start)] : [];
         const seekOrig = start - sA > 0.2 ? ['-ss', String(start - sA)] : [];
+        // громкость родной дорожки под переводом — из настроек, 0.3 по умолчанию
+        const ov = acc.vot.origVol == null ? 0.3 : Math.max(0, Math.min(1, Number(acc.vot.origVol)));
         const mixArgs = (norm) => [
           ...seekOrig, '-i', aName, ...seekVot, '-i', 'vot.mp3',
-          '-filter_complex', '[0:a]volume=0.3[o];[o][1:a]amix=inputs=2:duration=first' + norm + '[a]',
+          '-filter_complex', '[0:a]volume=' + ov.toFixed(2) + '[o];[o][1:a]amix=inputs=2:duration=first' + norm + '[a]',
           '-map', '[a]', ...limit, '-c:a', 'aac', '-b:a', '192k', 'mix.m4a',
         ];
         const repArgs = [...seekVot, '-i', 'vot.mp3', ...limit, '-c:a', 'aac', '-b:a', '192k', 'mix.m4a'];
@@ -389,10 +427,19 @@ async function finalize(acc) {
       ffPhase = run.phase;
       const ret = await inst.exec(run.args);
       if (ret === 0) {
+        // вырезки сдвигают время, а субтитры и главы приходят с исходной шкалой —
+        // с ними вшивать нечего, файл собирается как раньше
+        const deco = cuts.length ? run.out
+          : await decorate(inst, run.out, run.ext, acc.srt, acc.chapters);
         try {
-          data = await inst.readFile(run.out);
-          if (data && data.length) { chosen = run; break; }
+          data = await inst.readFile(deco);
+          if (data && data.length) {
+            chosen = run;
+            if (deco !== run.out) await rm(inst, deco);
+            break;
+          }
         } catch (e) { /* try next */ }
+        if (deco !== run.out) await rm(inst, deco);
       }
       lastErr = 'ffmpeg код ' + ret + ': ' + ffLog.slice(-6).join(' | ');
       await rm(inst, run.out);
@@ -718,6 +765,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       start: msg.start || 0,
       end: msg.end || 0,
       sb: Array.isArray(msg.sb) ? msg.sb : [],
+      srt: msg.srt || '',           // готовый .srt под выбранный диапазон
+      chapters: msg.chapters || '', // готовый ffmetadata с главами
       // полная спецификация перевода, а не только ключ: offscreen могло
       // пересоздать посреди передачи (OOM), и тогда votJobs пуст — по спецификации
       // votAwait запустит перевод заново вместо «перевод не запускался»

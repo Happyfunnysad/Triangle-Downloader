@@ -391,19 +391,32 @@
     for (let i = 0; i < 30 && transcriptLangLabel() !== name; i++) await sleep(150);
     await sleep(500); // let the new segment list render
   }
+  // "1:23" / "1:02:03" → секунды
+  function parseStamp(s) {
+    const p = String(s || '').trim().split(':').map(Number);
+    if (!p.length || p.some((n) => !isFinite(n))) return null;
+    let v = 0; for (const n of p) v = v * 60 + n;
+    return v;
+  }
+  // Реплики с временем. Время у панели есть всегда: точное в data-start-ms, а
+  // если разметка сменится — в видимой подписи «1:23», по ней и разбираем.
   function extractTranscriptText() {
     const list = activeTranscriptList();
     if (!list) return [];
-    const lines = [];
+    const cues = [];
     for (const s of list.querySelectorAll('ytd-transcript-segment-renderer')) {
       const tx = s.querySelector('.segment-text, yt-formatted-string.segment-text');
       if (!tx) continue;
-      const t = tx.textContent.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
-      if (!t) continue;
-      if (lines.length && lines[lines.length - 1] === t) continue; // drop repeated cues
-      lines.push(t);
+      const text = tx.textContent.replace(/\s*\n\s*/g, ' ').replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      if (cues.length && cues[cues.length - 1].text === text) continue; // drop repeated cues
+      const ms = s.querySelector('[data-start-ms]');
+      const stamp = s.querySelector('.segment-timestamp');
+      const t = ms ? Number(ms.getAttribute('data-start-ms')) / 1000
+                   : (stamp ? parseStamp(stamp.textContent) : null);
+      cues.push({ t: isFinite(t) && t != null ? t : null, text });
     }
-    return lines;
+    return cues;
   }
   async function getSubtitles() {
     const tracks = captionTracks();
@@ -413,16 +426,16 @@
             || tracks.find(t => t.languageCode === 'ru');
     const wantName = ru ? trackName(ru) : null;
 
-    let lines = [], lang = ru ? 'ru' : 'txt', lastErr = null;
+    let cues = [], lang = ru ? 'ru' : 'txt', lastErr = null;
     // Retry: YouTube occasionally opens an empty transcript. Close + reopen fresh.
-    for (let attempt = 0; attempt < 3 && !lines.length; attempt++) {
+    for (let attempt = 0; attempt < 3 && !cues.length; attempt++) {
       if (attempt > 0) { closeTranscript(); await sleep(800); }
       try {
         if (!(await openTranscriptOnce())) { lastErr = new Error('расшифровка не загрузилась'); continue; }
         if (wantName) await selectTranscriptLanguage(wantName);
         for (let i = 0; i < 20 && !extractTranscriptText().length; i++) await sleep(150);
-        lines = extractTranscriptText();
-        if (lines.length && !ru) {
+        cues = extractTranscriptText();
+        if (cues.length && !ru) {
           const match = tracks.find(t => trackName(t) === transcriptLangLabel());
           lang = (match && match.languageCode) || (tracks[0].languageCode) || 'txt';
         }
@@ -430,8 +443,32 @@
     }
 
     closeTranscript(); // we're done — leave the player as we found it
-    if (!lines.length) throw new Error((lastErr && lastErr.message) || 'не удалось получить расшифровку');
-    return { text: lines.join('\n'), lang };
+    if (!cues.length) throw new Error((lastErr && lastErr.message) || 'не удалось получить расшифровку');
+    return { cues, lang };
+  }
+
+  // ---- главы ---------------------------------------------------------------
+  // YouTube строит главы из описания: строки вида «0:00 Вступление», начиная с
+  // нуля. Разбираем тот же источник — он приходит в ответе плеера, поэтому не
+  // зависит ни от вёрстки панели, ни от того, развёрнуто ли описание.
+  function chapters() {
+    let d = '';
+    try { d = player().getPlayerResponse().videoDetails.shortDescription || ''; } catch (e) {}
+    if (!d) {
+      try { d = window.ytInitialPlayerResponse.videoDetails.shortDescription || ''; } catch (e) {}
+    }
+    const out = [];
+    for (const line of String(d).split('\n')) {
+      const m = line.match(/^\s*\(?(\d{1,2}:\d{2}(?::\d{2})?)\)?\s*[-–—.)\]]?\s*(.+?)\s*$/);
+      if (!m) continue;
+      const t = parseStamp(m[1]);
+      if (t == null || !m[2]) continue;
+      out.push({ t, title: m[2] });
+    }
+    out.sort((a, b) => a.t - b.t);
+    // без главы с нуля это просто тайм-коды в комментарии автора, а не разметка
+    if (!out.length || out[0].t !== 0) return [];
+    return out;
   }
 
   // ---- bridge to the isolated-world UI script ------------------------------
@@ -455,6 +492,7 @@
           duration: dur,
           heights: availableHeights(),
           audioLang: detectAudioLang(),
+          chapters: chapters(),
         });
       } else if (cmd === 'play') {
         // background worker tabs: YouTube leaves the player "cued" until playback
@@ -489,7 +527,7 @@
         reply(payload, transfers);
       } else if (cmd === 'subtitles') {
         const res = await getSubtitles();
-        reply({ ok: true, done: true, text: res.text, lang: res.lang });
+        reply({ ok: true, done: true, cues: res.cues, lang: res.lang });
       }
     } catch (e) {
       reply({ ok: false, error: String((e && e.message) || e) });

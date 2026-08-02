@@ -1,7 +1,18 @@
-/* Triangle Downloader — UI v2. Same surfaces as before (player button, menu,
-   progress toast, parallel panel), reorganised: one range strip instead of two
-   timecode fields, a segmented format row, one primary action, settings folded
-   behind a second pane. */
+/* Triangle Downloader — UI v3.
+   Поверхности те же (кнопка в плеере, меню, тост, панель параллельной загрузки,
+   очередь), переработаны две из них:
+
+   * НАСТРОЙКИ. Раньше это была одна колонка из пятнадцати строк, под каждой —
+     пояснение, а следом развёрнутые формы всех получателей. Теперь четыре
+     вкладки (Видео / Загрузка / Перевод / Куда), пояснения под общим
+     переключателем «?», получатели — свёрнутыми карточками.
+
+   * ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА. Раньше — ряд одинаковых полосок по 8 px и одна
+     строка текста. Теперь это монитор: лента фрагментов в пропорции их длины,
+     счётчики, скорость и список фрагментов с их состоянием и ошибками.
+
+   Палитра прежняя: тёмная подложка, один акцент #ff4e45, состояния — зелёный /
+   янтарный / красный. Никаких градиентов и полупрозрачных стёкол. */
 
 /* ── button in the player's right-controls ───────────────────────────────── */
 .ytdl-btn {
@@ -25,7 +36,7 @@
   border: 1px solid rgba(255,255,255,.1);
   border-radius: 14px;
   padding: 14px;
-  width: 336px;
+  width: min(344px, calc(100vw - 16px));
   max-height: 70vh;
   overflow-y: auto;
   box-shadow: 0 12px 36px rgba(0,0,0,.6);
@@ -47,6 +58,7 @@
 }
 .ytdl-gear svg { width: 16px; height: 16px; }
 .ytdl-gear:hover { background: rgba(255,255,255,.12); color: #fff; }
+.ytdl-gear.on { background: rgba(255,255,255,.14); color: #fff; }
 /* очередь стоит слева от шестерёнки — «прижимает» вправо уже она */
 .ytdl-qbtn { position: relative; }
 .ytdl-qbtn + .ytdl-gear { margin-left: 0; }
@@ -145,12 +157,48 @@
 .ytdl-chips button.on { background: rgba(255,78,69,.16); color: #ff8f89; }
 .ytdl-chips button:hover { color: #fff; }
 
-/* settings pane */
+/* ── настройки: вкладки ──────────────────────────────────────────────────── */
+.ytdl-settings { gap: 12px; }
+.ytdl-sbar { display: flex; align-items: center; gap: 6px; }
+.ytdl-tabs {
+  flex: 1; min-width: 0;
+  display: flex; gap: 2px;
+  background: rgba(255,255,255,.06); border-radius: 9px; padding: 3px;
+}
+.ytdl-tab {
+  flex: 1; min-width: 0;
+  border: 0; border-radius: 7px; cursor: pointer;
+  background: transparent; color: #9aa0a6;
+  font: inherit; font-size: 12px; padding: 6px 4px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ytdl-tab:hover { color: #fff; }
+.ytdl-tab.sel { background: rgba(255,255,255,.16); color: #fff; font-weight: 600; }
+.ytdl-tab .n {
+  margin-left: 4px;
+  font-size: 10px; font-weight: 700; color: #ff8f89;
+  font-variant-numeric: tabular-nums;
+}
+/* «?» — общий выключатель пояснений: без него пояснения занимали больше места,
+   чем сами настройки, а читают их один раз в жизни */
+.ytdl-info {
+  flex: none;
+  width: 28px; height: 28px;
+  display: grid; place-items: center;
+  background: rgba(255,255,255,.06); border: 0; border-radius: 8px;
+  color: #9aa0a6; font: inherit; font-size: 13px; font-weight: 700; cursor: pointer;
+}
+.ytdl-info:hover { color: #fff; background: rgba(255,255,255,.13); }
+.ytdl-info.on { background: rgba(255,78,69,.2); color: #ff8f89; }
+
+.ytdl-tabpane { display: flex; flex-direction: column; gap: 12px; }
+
+/* ── строка настройки ────────────────────────────────────────────────────── */
 .ytdl-row { display: flex; flex-direction: column; gap: 5px; }
-.ytdl-row-top { display: flex; align-items: center; gap: 8px; }
-.ytdl-row-top > span { font-size: 12.5px; color: #e6e6e6; }
+.ytdl-row-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ytdl-row-top > span { flex: 1 1 112px; min-width: 0; font-size: 12.5px; color: #e6e6e6; }
 .ytdl-opts {
-  margin-left: auto; display: flex; gap: 2px;
+  margin-left: auto; display: flex; gap: 2px; flex-wrap: wrap; justify-content: flex-end;
   background: rgba(255,255,255,.06); border-radius: 8px; padding: 2px;
 }
 .ytdl-opts button {
@@ -160,7 +208,18 @@
 }
 .ytdl-opts button:hover { color: #fff; }
 .ytdl-opts button.sel { background: rgba(255,78,69,.22); color: #ff8f89; font-weight: 600; }
-.ytdl-hint { font-size: 11px; color: #6f7378; line-height: 1.35; }
+/* многовариантный набор (категории SponsorBlock) — своей строкой и с переносом:
+   восемь кнопок в одну линию не помещались никогда */
+.ytdl-opts-wrap { margin-left: 0; flex-wrap: wrap; }
+
+/* пояснение показывается только при включённом «?» */
+.ytdl-hint { display: none; font-size: 11px; color: #6f7378; line-height: 1.35; }
+.ytdl-menu.hints .ytdl-hint { display: block; }
+/* а это — состояние, а не пояснение: «нужен помощник», «ищу серверы…»,
+   найденные шары. Такое видно всегда */
+.ytdl-note { font-size: 11px; color: #6f7378; line-height: 1.35; }
+.ytdl-note.warn { color: #e8a33d; }
+
 .ytdl-select {
   margin-left: auto;
   max-width: 60%;
@@ -174,13 +233,12 @@
 .ytdl-mini {
   background: rgba(255,255,255,.06); border: 0; border-radius: 8px;
   color: #e6e6e6; font: inherit; font-size: 11.5px;
-  padding: 4px 8px; cursor: pointer; white-space: nowrap;
+  padding: 5px 9px; cursor: pointer; white-space: nowrap;
 }
 .ytdl-mini:hover { background: rgba(255,255,255,.14); }
 .ytdl-mini:disabled { color: #6f7378; cursor: default; }
 .ytdl-sec {
   font-size: 11px; color: #6f7378; text-transform: uppercase; letter-spacing: .06em;
-  margin-top: 2px;
 }
 .ytdl-fgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .ytdl-f {
@@ -198,6 +256,57 @@
   margin-top: 6px;
 }
 .ytdl-err:empty { display: none; }
+
+/* ── получатели: карточка на каждого ─────────────────────────────────────── */
+.ytdl-card {
+  border: 1px solid rgba(255,255,255,.09);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.ytdl-card.active { border-color: rgba(255,78,69,.5); }
+.ytdl-card-top {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; box-sizing: border-box;
+  background: transparent; border: 0;
+  padding: 9px 10px;
+  color: #e6e6e6; font: inherit; font-size: 12.5px; text-align: left;
+  cursor: pointer;
+}
+.ytdl-card-top:hover { background: rgba(255,255,255,.05); }
+.ytdl-card-name { flex: none; }
+.ytdl-card-st {
+  margin-left: auto;
+  font-size: 11px; color: #6f7378;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ytdl-card-st.on { color: #ff8f89; }
+.ytdl-card-st.bad { color: #ff9d8f; }
+.ytdl-chev {
+  flex: none;
+  color: #6f7378; font-size: 13px; line-height: 1;
+  transform: rotate(90deg);
+  transition: transform .15s;
+}
+.ytdl-card.open .ytdl-chev { transform: rotate(270deg); }
+.ytdl-card-body {
+  display: none;
+  flex-direction: column; gap: 7px;
+  padding: 2px 10px 10px;
+}
+.ytdl-card.open .ytdl-card-body { display: flex; }
+.ytdl-use { align-self: flex-start; }
+
+/* подвал настроек */
+.ytdl-foot {
+  display: flex; align-items: center; gap: 8px;
+  padding-top: 2px;
+}
+.ytdl-back {
+  background: transparent; border: 0; padding: 0;
+  color: #9aa0a6; font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.ytdl-back:hover { color: #fff; }
+.ytdl-foot .ytdl-mini { margin-left: auto; }
 
 /* destination pills — first-class, on the main pane above the action */
 .ytdl-dest { display: flex; flex-direction: column; gap: 7px; }
@@ -220,45 +329,154 @@
 .ytdl-pill.sel .ytdl-pill-b { background: #ff4e45; color: #fff; }
 .ytdl-pill-add { padding: 6px 12px; color: #9aa0a6; font-size: 14px; line-height: 1; }
 .ytdl-dest-path { font-size: 11px; color: #6f7378; font-variant-numeric: tabular-nums; }
-.ytdl-back {
-  align-self: flex-start;
-  background: transparent; border: 0; padding: 0;
-  color: #9aa0a6; font: inherit; font-size: 11.5px; cursor: pointer;
-}
-.ytdl-back:hover { color: #fff; }
 
-/* ── parallel download panel ─────────────────────────────────────────────── */
+/* ── панель параллельной загрузки ────────────────────────────────────────── */
 #ytdl-panel {
   position: fixed;
   right: 20px; bottom: 20px;
   z-index: 2147483647;
-  width: 340px;
-  display: flex; flex-direction: column; gap: 10px;
+  box-sizing: border-box;
+  width: min(372px, calc(100vw - 16px));
+  display: flex; flex-direction: column; gap: 11px;
   background: rgba(24,24,24,.98);
   color: #fff;
   border: 1px solid rgba(255,255,255,.1);
   border-radius: 14px;
-  padding: 14px;
+  padding: 13px 14px;
   font-family: "YouTube Sans", Roboto, Arial, sans-serif;
   font-size: 13px;
   box-shadow: 0 12px 36px rgba(0,0,0,.6);
   animation: ytdl-in .16s ease-out;
 }
-#ytdl-panel .ytdl-panel-head {
-  display: flex; align-items: center; gap: 8px;
-  color: #9aa0a6; font-size: 12px;
+#ytdl-panel.min { gap: 9px; }
+#ytdl-panel.min .ytdl-p-hide { display: none; }
+
+.ytdl-p-head { display: flex; align-items: center; gap: 8px; }
+.ytdl-p-head svg { width: 13px; height: 13px; display: block; }
+.ytdl-p-mark { width: 13px; height: 13px; flex: none; }
+.ytdl-p-title { font-size: 12px; color: #9aa0a6; white-space: nowrap; }
+.ytdl-p-badge {
+  flex: none;
+  padding: 2px 7px; border-radius: 999px;
+  background: rgba(255,255,255,.11); color: #cfd2d5;
+  font-size: 9.5px; font-style: normal; font-weight: 700; letter-spacing: .04em;
+  text-transform: uppercase;
 }
-#ytdl-panel .ytdl-panel-head svg { width: 13px; height: 13px; display: block; }
-#ytdl-panel .ytdl-panel-stat { font-size: 11.5px; color: #9aa0a6; line-height: 1.35; }
-#ytdl-panel .ytdl-panel-frags { display: flex; gap: 3px; }
-.ytdl-chip { flex: 1; height: 8px; border-radius: 3px; background: rgba(255,255,255,.16); }
-.ytdl-chip-run  { background: #e8a33d; animation: ytdl-pulse 1.6s ease-in-out infinite; }
-.ytdl-chip-done { background: #3dba54; }
-.ytdl-chip-err  { background: #ff4e45; }
-@keyframes ytdl-pulse { 0%,100% { opacity: 1; } 50% { opacity: .5; } }
-#ytdl-panel .ytdl-panel-warn { color: #e8a33d; font-size: 11.5px; line-height: 1.35; }
-#ytdl-panel .ytdl-panel-warn:empty { display: none; }
-#ytdl-panel .ytdl-panel-btns { display: flex; gap: 6px; }
+.ytdl-p-badge.run    { background: rgba(232,163,61,.18);  color: #e8a33d; }
+.ytdl-p-badge.pause  { background: rgba(255,255,255,.11); color: #9aa0a6; }
+.ytdl-p-badge.merge  { background: rgba(232,163,61,.18);  color: #e8a33d; }
+.ytdl-p-badge.stall,
+.ytdl-p-badge.error  { background: rgba(255,78,69,.18);   color: #ff6b63; }
+.ytdl-p-badge.done   { background: rgba(61,186,84,.18);   color: #3dba54; }
+.ytdl-p-badge.cancel { background: rgba(255,255,255,.11); color: #6f7378; }
+.ytdl-p-pct {
+  margin-left: auto;
+  font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.ytdl-p-icon {
+  flex: none;
+  width: 22px; height: 22px; display: grid; place-items: center;
+  background: transparent; border: 0; border-radius: 6px;
+  color: #6f7378; font: inherit; font-size: 13px; line-height: 1; cursor: pointer;
+}
+.ytdl-p-icon:hover { background: rgba(255,255,255,.12); color: #fff; }
+
+.ytdl-p-name {
+  font-size: 11.5px; color: #6f7378;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* общий прогресс */
+.ytdl-p-bar { height: 5px; border-radius: 3px; background: rgba(255,255,255,.14); overflow: hidden; }
+.ytdl-p-bar i { display: block; height: 100%; width: 0%; background: #ff4e45; transition: width .25s; }
+.ytdl-p-bar.done i { background: #3dba54; }
+.ytdl-p-bar.err i  { background: #ff4e45; }
+
+/* лента фрагментов: ширина блока пропорциональна длине куска, поэтому видно,
+   какая часть ролика уже дома, а не «сколько штук из скольких» */
+.ytdl-p-line { display: flex; gap: 2px; height: 14px; }
+.ytdl-p-seg {
+  position: relative;
+  min-width: 3px;
+  border-radius: 3px;
+  background: rgba(255,255,255,.13);
+  overflow: hidden;
+}
+.ytdl-p-seg i {
+  position: absolute; left: 0; top: 0; bottom: 0;
+  width: 0%;
+  background: #e8a33d;
+  transition: width .25s;
+}
+.ytdl-p-seg-run  { background: rgba(232,163,61,.22); }
+.ytdl-p-seg-run i { animation: ytdl-pulse 1.8s ease-in-out infinite; }
+.ytdl-p-seg-done { background: #3dba54; }
+.ytdl-p-seg-err  { background: #ff4e45; }
+@keyframes ytdl-pulse { 0%,100% { opacity: 1; } 50% { opacity: .55; } }
+
+/* счётчики */
+.ytdl-p-stats {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+}
+.ytdl-p-stat { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.ytdl-p-stat b {
+  font-size: 14px; font-weight: 600; line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ytdl-p-stat span {
+  font-size: 10px; color: #6f7378; letter-spacing: .02em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ytdl-p-stat.err b { color: #ff6b63; }
+.ytdl-p-stat.ok b  { color: #3dba54; }
+
+.ytdl-p-stat-line { font-size: 11.5px; color: #9aa0a6; line-height: 1.35; }
+
+/* список фрагментов */
+.ytdl-p-more {
+  align-self: flex-start;
+  background: transparent; border: 0; padding: 0;
+  color: #9aa0a6; font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.ytdl-p-more:hover { color: #fff; }
+.ytdl-p-list {
+  display: flex; flex-direction: column; gap: 7px;
+  max-height: 168px; overflow-y: auto;
+  margin: 0 -4px; padding: 0 4px;
+}
+.ytdl-p-frag { display: flex; flex-direction: column; gap: 4px; }
+.ytdl-p-frag.done { opacity: .6; }
+.ytdl-p-frag-top {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 11.5px;
+}
+.ytdl-p-frag-i {
+  flex: none;
+  min-width: 18px; padding: 1px 5px; border-radius: 5px;
+  background: rgba(255,255,255,.1); color: #9aa0a6;
+  font-size: 10px; font-style: normal; font-weight: 700; text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.ytdl-p-frag-t { flex: none; color: #cfd2d5; font-variant-numeric: tabular-nums; }
+.ytdl-p-frag-st { margin-left: auto; flex: none; color: #9aa0a6; }
+.ytdl-p-frag-st.run  { color: #e8a33d; }
+.ytdl-p-frag-st.done { color: #3dba54; }
+.ytdl-p-frag-st.err  { color: #ff6b63; }
+.ytdl-p-frag-bar { height: 3px; border-radius: 2px; background: rgba(255,255,255,.12); overflow: hidden; }
+.ytdl-p-frag-bar i { display: block; height: 100%; width: 0%; background: #e8a33d; transition: width .25s; }
+.ytdl-p-frag-bar.done i { background: #3dba54; }
+.ytdl-p-frag-bar.err i  { background: #ff4e45; }
+.ytdl-p-frag-err {
+  font-size: 10.5px; color: #ff9d8f; line-height: 1.3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.ytdl-p-warn { color: #e8a33d; font-size: 11.5px; line-height: 1.35; }
+.ytdl-p-warn:empty { display: none; }
+
+.ytdl-p-btns { display: flex; gap: 6px; }
 .ytdl-pbtn {
   background: rgba(255,255,255,.1);
   border: 0; border-radius: 8px;
@@ -281,7 +499,7 @@
   position: fixed;
   left: 20px; bottom: 20px;
   z-index: 2147483647;
-  width: 320px;
+  width: min(320px, calc(100vw - 16px));
   max-height: min(60vh, 460px);
   display: flex; flex-direction: column; gap: 10px;
   background: rgba(24,24,24,.98);
@@ -328,10 +546,18 @@
   font-size: 12.5px; color: #e6e6e6;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.ytdl-q-st { flex: none; font-size: 11px; color: #9aa0a6; }
-.ytdl-q-st-done { color: #3dba54; }
-.ytdl-q-st-error, .ytdl-q-st-stall { color: #ff6b63; }
-.ytdl-q-st-merge { color: #e8a33d; }
+/* состояние — такой же плашкой, как в панели параллельной загрузки */
+.ytdl-q-st {
+  flex: none;
+  padding: 2px 7px; border-radius: 999px;
+  background: rgba(255,255,255,.11); color: #9aa0a6;
+  font-size: 9.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+}
+.ytdl-q-st-run   { background: rgba(232,163,61,.18); color: #e8a33d; }
+.ytdl-q-st-merge { background: rgba(232,163,61,.18); color: #e8a33d; }
+.ytdl-q-st-done  { background: rgba(61,186,84,.18);  color: #3dba54; }
+.ytdl-q-st-error,
+.ytdl-q-st-stall { background: rgba(255,78,69,.18);  color: #ff6b63; }
 .ytdl-q-x {
   flex: none;
   width: 18px; height: 18px; display: grid; place-items: center;
@@ -345,6 +571,7 @@
   background: transparent; border: 0; border-radius: 5px;
   color: #9aa0a6; font: inherit; font-size: 12px; cursor: pointer;
 }
+.ytdl-q-re svg { width: 12px; height: 12px; display: block; }
 .ytdl-q-re:hover { background: rgba(255,255,255,.14); color: #fff; }
 .ytdl-q-re:disabled { color: #4a4d50; cursor: default; background: transparent; }
 .ytdl-q-warn { font-size: 11px; color: #e8a33d; line-height: 1.35; }
@@ -360,7 +587,7 @@
   position: fixed;
   right: 20px; bottom: 20px;
   z-index: 2147483647;
-  width: 320px;
+  width: min(320px, calc(100vw - 16px));
   display: flex; flex-direction: column; gap: 9px;
   background: rgba(24,24,24,.98);
   color: #fff;
@@ -401,3 +628,18 @@
   padding: 5px 9px; cursor: pointer;
 }
 #ytdl-toast .ytdl-toast-copy:hover { background: rgba(255,255,255,.16); }
+
+@media (max-width: 480px) {
+  #ytdl-panel,
+  #ytdl-queue,
+  #ytdl-toast {
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    width: auto;
+  }
+  #ytdl-panel,
+  #ytdl-queue {
+    max-height: min(72vh, 520px);
+  }
+}
